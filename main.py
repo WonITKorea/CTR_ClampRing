@@ -8,7 +8,7 @@ from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QGridLayout, QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox,
                              QSizePolicy, QTableWidget, QTableWidgetItem, QHeaderView, QGroupBox,
-                             QFileDialog, QMessageBox)
+                             QFileDialog, QMessageBox, QPlainTextEdit)
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QImage, QPixmap
 import matplotlib.pyplot as plt
@@ -331,6 +331,7 @@ class ClampSimulatorApp(QMainWindow):
         self.latest_ring_measurement = None
         self.camera_baseline = None
         self.camera_read_failures = 0
+        self._system_log_last_seen = {}
 
         # 데이터 저장소
         self.stroke_data_history = []  # 각 스트로크 최종 결과 저장
@@ -383,19 +384,19 @@ class ClampSimulatorApp(QMainWindow):
 
         group_report = QGroupBox("Report")
         layout_report = QGridLayout()
-        layout_report.addWidget(QLabel("관리번호 (Report No):"), 0, 0)
+        layout_report.addWidget(QLabel("관리번호\n(Report Number)"), 0, 0)
         self.in_report_no = QLineEdit(f"Q-26-{datetime.now().strftime('%m%d')}-001")
         layout_report.addWidget(self.in_report_no, 0, 1)
-        layout_report.addWidget(QLabel("고객사 (Customer):"), 1, 0)
+        layout_report.addWidget(QLabel("고객사\n(Customer)"), 1, 0)
         self.in_customer = QLineEdit("TESLA")
         layout_report.addWidget(self.in_customer, 1, 1)
-        layout_report.addWidget(QLabel("차종 (Model):"), 2, 0)
+        layout_report.addWidget(QLabel("차종\n(Model)"), 2, 0)
         self.in_model = QLineEdit("PMY")
         layout_report.addWidget(self.in_model, 2, 1)
-        layout_report.addWidget(QLabel("품명 (Part Name):"), 3, 0)
+        layout_report.addWidget(QLabel("품명\n(Part Name)"), 3, 0)
         self.in_part_name = QLineEdit("CABJ O-Ring")
         layout_report.addWidget(self.in_part_name, 3, 1)
-        layout_report.addWidget(QLabel("품번 (Part No):"), 4, 0)
+        layout_report.addWidget(QLabel("품번\n(Part Number)"), 4, 0)
         self.in_part_no = QLineEdit("GCR0127")
         layout_report.addWidget(self.in_part_no, 4, 1)
         group_report.setLayout(layout_report)
@@ -534,9 +535,7 @@ class ClampSimulatorApp(QMainWindow):
         )
         if not NIDAQMX_AVAILABLE:
             init_fc400_status = f"USB-6002: nidaqmx import failed - {NIDAQMX_IMPORT_ERROR}"
-        self.lbl_fc400_status = QLabel(init_fc400_status)
-        self.lbl_fc400_status.setWordWrap(True)
-        layout_fc400.addWidget(self.lbl_fc400_status, 4, 0, 1, 4)
+        self._fc400_status_text = init_fc400_status
 
         group_fc400.setLayout(layout_fc400)
         left_layout.addWidget(group_fc400, 3, 0, 1, 2)
@@ -685,7 +684,7 @@ class ClampSimulatorApp(QMainWindow):
         stop_layout = QHBoxLayout()
         self.btn_mr_stop = QPushButton("Stop")
         self.btn_mr_stop.clicked.connect(lambda: self.stop_position_motion(False))
-        self.btn_mr_rapid_stop = QPushButton("RAPID STOP")
+        self.btn_mr_rapid_stop = QPushButton("EMERG STOP")
         self.btn_mr_rapid_stop.clicked.connect(lambda: self.stop_position_motion(True))
         self.btn_mr_rapid_stop.setStyleSheet(
             "background-color: #C62828; color: white; font-weight: bold;"
@@ -721,15 +720,32 @@ class ClampSimulatorApp(QMainWindow):
         mr_status = "MR-MC240N: Windows + matching Mitsubishi API DLL required"
         if os.name != "nt":
             mr_status = f"MR-MC240N: {MR_MC240N_WINDOWS_ONLY_MESSAGE}"
-        self.lbl_mr_status = QLabel(mr_status)
-        self.lbl_mr_status.setWordWrap(True)
-        self.lbl_mr_status.setMinimumHeight(42)
-        self.lbl_mr_status.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.lbl_mr_status.setStyleSheet(
-            "QLabel { background: #F5F7FA; border: 1px solid #D8DEE9; "
-            "border-radius: 4px; padding: 7px; }"
+
+        log_group = QGroupBox("System Log")
+        log_layout = QVBoxLayout(log_group)
+        log_layout.setContentsMargins(8, 10, 8, 8)
+        log_layout.setSpacing(6)
+
+        self.system_log = QPlainTextEdit()
+        self.system_log.setReadOnly(True)
+        self.system_log.setMinimumHeight(100)
+        self.system_log.setMaximumHeight(160)
+        self.system_log.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+        self.system_log.document().setMaximumBlockCount(500)
+        self.system_log.setStyleSheet(
+            "QPlainTextEdit { background: #F5F7FA; border: 1px solid #D8DEE9; "
+            "border-radius: 4px; padding: 6px; font-family: Consolas, monospace; }"
         )
-        layout_position.addWidget(self.lbl_mr_status)
+        log_layout.addWidget(self.system_log)
+
+        self.btn_clear_system_log = QPushButton("Clear Log")
+        self.btn_clear_system_log.clicked.connect(self.clear_system_log)
+        log_layout.addWidget(self.btn_clear_system_log, 0, Qt.AlignRight)
+        layout_position.addWidget(log_group)
+
+        self.append_system_log("Application initialized", "SYSTEM")
+        self.append_system_log(init_fc400_status, "FC400")
+        self.append_system_log(mr_status, "MR-MC240N")
 
         group_position.setLayout(layout_position)
         left_layout.addWidget(group_position, 0, 2, 5, 1)
@@ -738,7 +754,7 @@ class ClampSimulatorApp(QMainWindow):
         self.btn_start.clicked.connect(self.toggle_simulation)
         self.btn_start.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 10px;")
         left_layout.addWidget(self.btn_start, 4, 0, 1, 2)
-        for widget_type in (QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox):
+        for widget_type in (QLineEdit, QPushButton, QComboBox, QCheckBox):
             for widget in left_container.findChildren(widget_type):
                 policy = widget.sizePolicy()
                 policy.setHorizontalPolicy(QSizePolicy.Ignored)
@@ -788,7 +804,7 @@ class ClampSimulatorApp(QMainWindow):
 
         self.btn_camera_toggle = QPushButton("Open Camera")
         self.btn_camera_toggle.clicked.connect(self.toggle_camera)
-        layout_camera.addWidget(self.btn_camera_toggle, 1, 2)
+        self.btn_camera_toggle.setMinimumHeight(34)
 
         self.btn_camera_baseline = QPushButton("Capture Baseline")
         self.btn_camera_baseline.clicked.connect(self.capture_ring_baseline)
@@ -800,13 +816,14 @@ class ClampSimulatorApp(QMainWindow):
         self.btn_camera_clear_baseline.setEnabled(False)
         layout_camera.addWidget(self.btn_camera_clear_baseline, 2, 2, 1, 2)
 
+        layout_camera.addWidget(self.btn_camera_toggle, 3, 0, 1, 4)
+
         init_camera_status = "Camera: connect a UVC camera and click Open Camera"
         if not CV2_AVAILABLE:
             init_camera_status = f"Camera: OpenCV import failed - {CV2_IMPORT_ERROR}"
             self.btn_camera_toggle.setEnabled(False)
-        self.lbl_camera_status = QLabel(init_camera_status)
-        self.lbl_camera_status.setWordWrap(True)
-        layout_camera.addWidget(self.lbl_camera_status, 3, 0, 1, 4)
+        self._camera_status_text = init_camera_status
+        self.append_system_log(init_camera_status, "CAMERA")
 
         self.lbl_camera_preview = QLabel("Camera preview is not running.")
         self.lbl_camera_preview.setAlignment(Qt.AlignCenter)
@@ -817,19 +834,16 @@ class ClampSimulatorApp(QMainWindow):
         )
         layout_camera.addWidget(self.lbl_camera_preview, 4, 0, 1, 4)
 
-        self.lbl_ring_metrics = QLabel(
-            "Ring measurement:\n"
-            "- 32-point profile; select the clamp ring color.\n"
-            "- Open and center the ring, then capture baseline."
-        )
+        self.lbl_ring_metrics = QLabel("")
         self.lbl_ring_metrics.setWordWrap(True)
+        self.lbl_ring_metrics.setVisible(False)
         self.lbl_ring_metrics.setStyleSheet(
             "background-color: #F8F8F8; border: 1px solid #D0D0D0; padding: 8px; font-family: monospace;"
         )
         layout_camera.addWidget(self.lbl_ring_metrics, 5, 0, 1, 4)
 
         group_camera.setLayout(layout_camera)
-        for widget_type in (QLabel, QLineEdit, QPushButton, QComboBox):
+        for widget_type in (QLineEdit, QPushButton, QComboBox):
             for widget in group_camera.findChildren(widget_type):
                 policy = widget.sizePolicy()
                 policy.setHorizontalPolicy(QSizePolicy.Ignored)
@@ -866,6 +880,50 @@ class ClampSimulatorApp(QMainWindow):
         self.update_camera_button_state()
         self.update_ring_metrics_label()
 
+    def append_system_log(self, message, source="SYSTEM", dedupe_seconds=2.0):
+        if not hasattr(self, "system_log"):
+            return
+
+        message_text = " | ".join(
+            part.strip() for part in str(message).splitlines() if part.strip()
+        )
+        if not message_text:
+            return
+
+        source_prefix = f"{source}:"
+        if message_text.lower().startswith(source_prefix.lower()):
+            message_text = message_text[len(source_prefix):].strip()
+
+        now_monotonic = time.monotonic()
+        signature = (source, message_text)
+        last_seen = self._system_log_last_seen.get(signature)
+        if (
+            dedupe_seconds > 0
+            and last_seen is not None
+            and now_monotonic - last_seen < dedupe_seconds
+        ):
+            return
+        self._system_log_last_seen[signature] = now_monotonic
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.system_log.appendPlainText(f"[{timestamp}] [{source}] {message_text}")
+        self.system_log.verticalScrollBar().setValue(
+            self.system_log.verticalScrollBar().maximum()
+        )
+
+    def clear_system_log(self):
+        self.system_log.clear()
+        self._system_log_last_seen.clear()
+        self.append_system_log("Log cleared", "SYSTEM", dedupe_seconds=0)
+
+    def set_mr_status_text(self, message):
+        self.append_system_log(message, "MR-MC240N")
+
+    def set_fc400_status_text(self, message):
+        if self._fc400_status_text != message:
+            self._fc400_status_text = message
+            self.append_system_log(message, "FC400")
+
     def update_camera_focus(self, size):
         self.lbl_camera.setText(f"Camera Focus Action: Adjusted to {size}")
         if hasattr(self, "in_camera_reference_diameter") and not self.in_camera_reference_diameter.isModified():
@@ -875,9 +933,11 @@ class ClampSimulatorApp(QMainWindow):
         self.lbl_camera_preview.clear()
         self.lbl_camera_preview.setText(message)
 
-    def set_camera_status_text(self, message):
-        if self.lbl_camera_status.text() != message:
-            self.lbl_camera_status.setText(message)
+    def set_camera_status_text(self, message, log_event=True):
+        if self._camera_status_text != message:
+            self._camera_status_text = message
+            if log_event:
+                self.append_system_log(message, "CAMERA")
 
     def get_camera_reference_diameter_value(self):
         reference_text = self.in_camera_reference_diameter.text().strip()
@@ -928,10 +988,23 @@ class ClampSimulatorApp(QMainWindow):
         camera_open = self.camera_capture is not None
         if CV2_AVAILABLE:
             self.btn_camera_toggle.setEnabled(True)
-            self.btn_camera_toggle.setText("Close Camera" if camera_open else "Open Camera")
+            self.btn_camera_toggle.setText(
+                "Close Camera / Stop Preview"
+                if camera_open
+                else "Open Camera / Start Preview"
+            )
+            if camera_open:
+                self.btn_camera_toggle.setStyleSheet(
+                    "background-color: #D32F2F; color: white; font-weight: bold;"
+                )
+            else:
+                self.btn_camera_toggle.setStyleSheet(
+                    "background-color: #388E3C; color: white; font-weight: bold;"
+                )
         else:
             self.btn_camera_toggle.setEnabled(False)
-            self.btn_camera_toggle.setText("Open Camera")
+            self.btn_camera_toggle.setText("Open Camera / Start Preview")
+            self.btn_camera_toggle.setStyleSheet("")
 
         self.btn_camera_baseline.setEnabled(camera_open and self.latest_ring_measurement is not None)
         self.btn_camera_clear_baseline.setEnabled(self.camera_baseline is not None)
@@ -985,6 +1058,9 @@ class ClampSimulatorApp(QMainWindow):
                 self.open_camera()
             except Exception as exc:
                 self.close_camera(reset_status=False)
+                self.append_system_log(
+                    f"UVC 카메라를 열지 못했습니다: {exc}", "CAMERA"
+                )
                 QMessageBox.warning(self, "Camera Error", f"UVC 카메라를 열지 못했습니다.\n{exc}")
         else:
             self.close_camera()
@@ -1081,6 +1157,9 @@ class ClampSimulatorApp(QMainWindow):
 
     def capture_ring_baseline(self):
         if self.latest_ring_measurement is None:
+            self.append_system_log(
+                "기준 형상 캡처 실패: 링이 검출되지 않았습니다", "CAMERA"
+            )
             QMessageBox.warning(self, "Baseline Error", "기준 형상을 캡처하려면 먼저 링이 검출되어야 합니다.")
             return
 
@@ -1152,14 +1231,19 @@ class ClampSimulatorApp(QMainWindow):
         target_description = self.get_camera_ring_target_description()
         if self.latest_ring_measurement is None:
             self.set_camera_status_text(
-                f"Camera: running, but the {target_description} was not detected"
+                f"Camera: running, but the {target_description} was not detected",
+                log_event=False,
             )
         elif self.camera_baseline is not None:
             self.set_camera_status_text(
-                f"Camera: running, {target_description} detected, baseline active"
+                f"Camera: running, {target_description} detected, baseline active",
+                log_event=False,
             )
         else:
-            self.set_camera_status_text(f"Camera: running, {target_description} detected")
+            self.set_camera_status_text(
+                f"Camera: running, {target_description} detected",
+                log_event=False,
+            )
 
     def build_camera_tracking_roi(self, measurement, frame_shape):
         frame_height, frame_width = frame_shape[:2]
@@ -1651,18 +1735,93 @@ class ClampSimulatorApp(QMainWindow):
         self.camera_tracking_roi = self.build_camera_tracking_roi(measurement, frame.shape)
         return measurement
 
+    @staticmethod
+    def draw_camera_overlay_text(
+        frame,
+        lines,
+        color,
+        font_scale=0.65,
+        thickness=2,
+    ):
+        if not lines:
+            return
+
+        frame_height, frame_width = frame.shape[:2]
+        margin_x = max(12, int(round(frame_width * 0.025)))
+        safe_top = max(20, int(round(frame_height * 0.06)))
+        padding_x = max(7, int(round(frame_width * 0.012)))
+        padding_y = max(6, int(round(frame_height * 0.012)))
+        line_gap = max(6, int(round(frame_height * 0.012)))
+        available_text_width = max(
+            1,
+            frame_width - (2 * margin_x) - (2 * padding_x),
+        )
+
+        def measure_text(scale):
+            return [
+                cv2.getTextSize(
+                    line,
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    scale,
+                    thickness,
+                )
+                for line in lines
+            ]
+
+        text_metrics = measure_text(font_scale)
+        widest_text = max(size[0][0] for size in text_metrics)
+        if widest_text > available_text_width:
+            font_scale *= available_text_width / widest_text
+            font_scale = max(0.35, font_scale)
+            text_metrics = measure_text(font_scale)
+
+        text_width = max(size[0][0] for size in text_metrics)
+        line_heights = [size[0][1] + size[1] for size in text_metrics]
+        text_block_height = sum(line_heights) + line_gap * (len(lines) - 1)
+        box_left = margin_x
+        box_top = safe_top
+        box_right = min(
+            frame_width - margin_x,
+            box_left + text_width + (2 * padding_x),
+        )
+        box_bottom = min(
+            frame_height - 1,
+            box_top + text_block_height + (2 * padding_y),
+        )
+
+        shade = frame.copy()
+        cv2.rectangle(
+            shade,
+            (box_left, box_top),
+            (box_right, box_bottom),
+            (0, 0, 0),
+            -1,
+        )
+        cv2.addWeighted(shade, 0.58, frame, 0.42, 0, frame)
+
+        baseline_y = box_top + padding_y + text_metrics[0][0][1]
+        for index, line in enumerate(lines):
+            cv2.putText(
+                frame,
+                line,
+                (box_left + padding_x, baseline_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                color,
+                thickness,
+                cv2.LINE_AA,
+            )
+            if index + 1 < len(lines):
+                baseline_y += line_heights[index] + line_gap
+
     def draw_ring_measurement_overlay(self, frame, measurement):
         if measurement is None:
             target_description = self.get_camera_ring_target_description().capitalize()
-            cv2.putText(
+            self.draw_camera_overlay_text(
                 frame,
-                f"{target_description} not detected",
-                (20, 35),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
+                [f"{target_description} not detected"],
                 (0, 0, 255),
-                2,
-                cv2.LINE_AA,
+                font_scale=0.9,
             )
             return frame
 
@@ -1706,19 +1865,12 @@ class ClampSimulatorApp(QMainWindow):
         elif measurement.get("profile_delta_max_abs_px") is not None:
             overlay_lines.append(f"Max Def.: {measurement['profile_delta_max_abs_px']:.2f}px")
 
-        origin_y = 30
-        for line in overlay_lines:
-            cv2.putText(
-                frame,
-                line,
-                (20, origin_y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (36, 255, 12),
-                2,
-                cv2.LINE_AA,
-            )
-            origin_y += 26
+        self.draw_camera_overlay_text(
+            frame,
+            overlay_lines,
+            (36, 255, 12),
+            font_scale=0.65,
+        )
 
         return frame
 
@@ -1754,58 +1906,8 @@ class ClampSimulatorApp(QMainWindow):
         self.lbl_camera_preview.setPixmap(pixmap)
 
     def update_ring_metrics_label(self):
-        if self.latest_ring_measurement is None:
-            baseline_text = "captured" if self.camera_baseline is not None else "not captured"
-            target_description = self.get_camera_ring_target_description()
-            metrics_text = (
-                "Ring measurement:\n"
-                f"- Detection: waiting for a centered {target_description}\n"
-                f"- Profile Points: up to {self.camera_profile_sample_count}\n"
-                f"- Baseline: {baseline_text}\n"
-                f"- Tip: {self.get_camera_ring_color_tip()}"
-            )
-            if self.lbl_ring_metrics.text() != metrics_text:
-                self.lbl_ring_metrics.setText(metrics_text)
-            return
-
-        measurement = self.latest_ring_measurement
-        lines = [
-            "Ring measurement:",
-            f"- Profile Points: {measurement['profile_valid_count']} / {measurement['profile_point_count']}",
-            f"- Profile Coverage: {measurement['profile_coverage'] * 100.0:.1f} %",
-            f"- Mean Diameter: {measurement['mean_px']:.2f} px",
-            f"- Diameter Spread: {measurement['ovality_px']:.2f} px",
-        ]
-        if measurement.get("major_mm") is not None:
-            lines.extend(
-                [
-                    f"- Mean Diameter: {measurement['mean_mm']:.3f} mm",
-                    f"- Diameter Spread: {measurement['ovality_mm']:.3f} mm",
-                ]
-            )
-        if measurement.get("thickness_mean_px") is not None:
-            lines.append(f"- Band Thickness Mean: {measurement['thickness_mean_px']:.2f} px")
-        if measurement.get("thickness_mean_mm") is not None:
-            lines.append(f"- Band Thickness Mean: {measurement['thickness_mean_mm']:.3f} mm")
-
-        if self.camera_baseline is None:
-            lines.append("- Baseline: not captured")
-        else:
-            lines.append("- Baseline: captured")
-            if measurement.get("profile_common_valid_count"):
-                lines.append(f"- Common Sample Points: {measurement['profile_common_valid_count']}")
-                lines.append(f"- Mean Radial Delta: {measurement['profile_delta_mean_abs_px']:.2f} px")
-                lines.append(f"- Max Radial Delta: {measurement['profile_delta_max_abs_px']:.2f} px")
-                if measurement.get("profile_delta_mean_abs_mm") is not None:
-                    lines.append(f"- Mean Radial Delta: {measurement['profile_delta_mean_abs_mm']:.3f} mm")
-                    lines.append(f"- Max Radial Delta: {measurement['profile_delta_max_abs_mm']:.3f} mm")
-                    lines.append(f"- Deformation Amount: {measurement['deformation_mm']:.3f} mm")
-            else:
-                lines.append("- Delta: waiting for enough common sample points after baseline capture")
-
-        metrics_text = "\n".join(lines)
-        if self.lbl_ring_metrics.text() != metrics_text:
-            self.lbl_ring_metrics.setText(metrics_text)
+        self.lbl_ring_metrics.clear()
+        self.lbl_ring_metrics.setVisible(False)
 
     def append_camera_metrics_to_log_row(self, log_row):
         measurement = self.latest_ring_measurement
@@ -1918,23 +2020,23 @@ class ClampSimulatorApp(QMainWindow):
 
         if enabled:
             if os.name != "nt":
-                self.lbl_mr_status.setText(f"MR-MC240N: {MR_MC240N_WINDOWS_ONLY_MESSAGE}")
+                self.set_mr_status_text(f"MR-MC240N: {MR_MC240N_WINDOWS_ONLY_MESSAGE}")
             elif self.is_position_usb_mode():
                 usb_info = detect_mr_mc240n_usb_controller()
                 if usb_info["connected"]:
                     driver_text = (
                         f" ({usb_info['driver']})" if usb_info["driver"] else ""
                     )
-                    self.lbl_mr_status.setText(
+                    self.set_mr_status_text(
                         "MR-MC240N: direct USB controller detected"
                         f"{driver_text}; press Connect USB Controller"
                     )
                 else:
-                    self.lbl_mr_status.setText(
+                    self.set_mr_status_text(
                         "MR-MC240N: USB controller not detected"
                     )
             else:
-                self.lbl_mr_status.setText(
+                self.set_mr_status_text(
                     "MR-MC240N: PCIe API enabled; connect the installed board"
                 )
         else:
@@ -1942,9 +2044,9 @@ class ClampSimulatorApp(QMainWindow):
                 self.chk_mr_motion_arm.setChecked(False)
             self.close_position_monitor()
             if os.name != "nt":
-                self.lbl_mr_status.setText(f"MR-MC240N: {MR_MC240N_WINDOWS_ONLY_MESSAGE}")
+                self.set_mr_status_text(f"MR-MC240N: {MR_MC240N_WINDOWS_ONLY_MESSAGE}")
             else:
-                self.lbl_mr_status.setText("MR-MC240N: disabled")
+                self.set_mr_status_text("MR-MC240N: disabled")
         self.update_position_control_state()
 
     def is_position_usb_mode(self):
@@ -1972,7 +2074,7 @@ class ClampSimulatorApp(QMainWindow):
             self.chk_mr_motion_arm.setChecked(False)
         self.close_position_monitor()
         if self.is_position_monitor_enabled():
-            self.lbl_mr_status.setText(
+            self.set_mr_status_text(
                 f"MR-MC240N: axis {self.in_mr_axis_no.currentText()} selected; reconnect"
             )
         self.update_position_control_state()
@@ -1987,6 +2089,9 @@ class ClampSimulatorApp(QMainWindow):
             and not MrMc240nUsbController.is_supported_platform()
         ):
             self.chk_mr_motion_arm.setChecked(False)
+            self.set_mr_status_text(
+                "MR-MC240N: USB direct control is available on Windows only"
+            )
             QMessageBox.information(
                 self,
                 "USB Direct Control Unavailable",
@@ -2006,13 +2111,13 @@ class ClampSimulatorApp(QMainWindow):
             if answer != QMessageBox.Yes:
                 self.chk_mr_motion_arm.setChecked(False)
                 return
-            self.lbl_mr_status.setText("MR-MC240N: motion commands armed")
+            self.set_mr_status_text("MR-MC240N: motion commands armed")
         else:
             if self.position_jog_command_active:
                 self.stop_position_motion(True)
             self.position_jog_command_active = False
             if self.is_position_monitor_enabled():
-                self.lbl_mr_status.setText("MR-MC240N: motion commands disarmed")
+                self.set_mr_status_text("MR-MC240N: motion commands disarmed")
         self.update_position_control_state()
 
     def update_position_control_state(self):
@@ -2060,21 +2165,21 @@ class ClampSimulatorApp(QMainWindow):
                         f"axis {controller.axis_number} "
                         f"{'READY' if axis_status['servo_ready'] else 'NOT READY'}"
                     )
-                self.lbl_mr_status.setText(
+                self.set_mr_status_text(
                     f"MR-MC240N: USB connected, identity {controller.identity}, "
                     f"system 0x{controller.system_status_code:04X} "
                     f"({controller.system_status_text(controller.system_status_code)}), "
                     f"{axis_text}"
                 )
             else:
-                self.lbl_mr_status.setText(
+                self.set_mr_status_text(
                     f"MR-MC240N: PCIe connected to board {controller.board_id}; "
                     f"axis {controller.axis_number}"
                 )
             self.refresh_position_axis_status()
         except Exception as exc:
             message = str(exc)
-            self.lbl_mr_status.setText(f"MR-MC240N: connection failed - {message}")
+            self.set_mr_status_text(f"MR-MC240N: connection failed - {message}")
             QMessageBox.critical(
                 self,
                 "MR-MC240N Connection Error",
@@ -2102,7 +2207,7 @@ class ClampSimulatorApp(QMainWindow):
             if not isinstance(controller, MrMc240nUsbController):
                 raise RuntimeError("USB direct controller가 선택되지 않았습니다.")
             status_code = controller.start_system()
-            self.lbl_mr_status.setText(
+            self.set_mr_status_text(
                 f"MR-MC240N: USB System Start sent, status 0x{status_code:04X}"
             )
         except Exception as exc:
@@ -2112,6 +2217,9 @@ class ClampSimulatorApp(QMainWindow):
         if not self.is_position_usb_mode():
             return
         if self.chk_mr_motion_arm.isChecked():
+            self.set_mr_status_text(
+                "MR-MC240N: six-axis preset blocked; disarm motion commands first"
+            )
             QMessageBox.warning(
                 self,
                 "Disarm Motion First",
@@ -2138,7 +2246,7 @@ class ClampSimulatorApp(QMainWindow):
                 raise RuntimeError("USB direct controller가 선택되지 않았습니다.")
             response = controller.configure_six_axis_btk1404()
             self.in_mr_counts_per_mm.setText("1000.0")
-            self.lbl_mr_status.setText(
+            self.set_mr_status_text(
                 "MR-MC240N: HG-KR13 ×6 / BTK1404 preset applied, "
                 f"system 0x{int(response['system_status']):04X}"
             )
@@ -2198,7 +2306,7 @@ class ClampSimulatorApp(QMainWindow):
             self.close_ni_daq_task()
             self.lbl_status.setText("Status: Ready (FC400 via NI USB-6002)")
             if not NIDAQMX_AVAILABLE:
-                self.lbl_fc400_status.setText(
+                self.set_fc400_status_text(
                     f"USB-6002: nidaqmx import failed - {NIDAQMX_IMPORT_ERROR}"
                 )
             else:
@@ -2206,7 +2314,7 @@ class ClampSimulatorApp(QMainWindow):
         else:
             self.close_ni_daq_task()
             self.lbl_status.setText("Status: Ready")
-            self.lbl_fc400_status.setText("FC400 / USB-6002 mode disabled")
+            self.set_fc400_status_text("FC400 / USB-6002 mode disabled")
 
         self.data_unit = self.get_source_data_unit()
         self.raw_data = [0.0] * 6
@@ -2220,10 +2328,11 @@ class ClampSimulatorApp(QMainWindow):
         self.update_chart(reset_scale=True)
 
         self.update_start_button_idle_state()
+        self.append_system_log(f"Input source selected: {source}", "TEST")
 
     def refresh_ni_devices(self):
         if not NIDAQMX_AVAILABLE:
-            self.lbl_fc400_status.setText(
+            self.set_fc400_status_text(
                 f"USB-6002: nidaqmx import failed - {NIDAQMX_IMPORT_ERROR}"
             )
             return
@@ -2258,13 +2367,13 @@ class ClampSimulatorApp(QMainWindow):
 
             if device_summaries:
                 status_text = ", ".join(device_summaries)
-                self.lbl_fc400_status.setText("USB-6002: " + status_text)
+                self.set_fc400_status_text("USB-6002: " + status_text)
             else:
-                self.lbl_fc400_status.setText(
+                self.set_fc400_status_text(
                     "USB-6002: no NI analog-input device found"
                 )
         except Exception as exc:
-            self.lbl_fc400_status.setText(
+            self.set_fc400_status_text(
                 f"USB-6002: device scan failed - {exc}"
             )
 
@@ -2385,7 +2494,7 @@ class ClampSimulatorApp(QMainWindow):
         self.ni_daq_task = task
         self.data_unit = config["device_unit"]
         self.update_table_headers()
-        self.lbl_fc400_status.setText(
+        self.set_fc400_status_text(
             f"FC400 / USB-6002: {config['physical_channel']} "
             f"({config['terminal_mode']}) @ {task.timing.samp_clk_rate:.0f} S/s"
         )
@@ -2482,7 +2591,7 @@ class ClampSimulatorApp(QMainWindow):
             raise
 
         self.position_monitor = monitor
-        self.lbl_mr_status.setText(
+        self.set_mr_status_text(
             f"MR-MC240N: board {config['board_id']} axis {config['axis_number']} opened"
         )
 
@@ -2534,7 +2643,7 @@ class ClampSimulatorApp(QMainWindow):
 
     def handle_position_command_error(self, action, exc):
         message = f"{action} 실패: {exc}"
-        self.lbl_mr_status.setText(f"MR-MC240N: {message}")
+        self.set_mr_status_text(f"MR-MC240N: {message}")
         QMessageBox.critical(self, "MR-MC240N Control Error", message)
 
     def set_position_servo(self, enabled):
@@ -2542,7 +2651,7 @@ class ClampSimulatorApp(QMainWindow):
         try:
             controller = self.get_position_controller(require_armed=True)
             controller.set_servo_on(enabled)
-            self.lbl_mr_status.setText(
+            self.set_mr_status_text(
                 f"MR-MC240N: {action} command sent to axis {controller.axis_number}"
             )
         except Exception as exc:
@@ -2552,7 +2661,7 @@ class ClampSimulatorApp(QMainWindow):
         try:
             controller = self.get_position_controller(require_armed=True)
             controller.start_home_return()
-            self.lbl_mr_status.setText(
+            self.set_mr_status_text(
                 f"MR-MC240N: home return started on axis {controller.axis_number}"
             )
         except Exception as exc:
@@ -2576,7 +2685,7 @@ class ClampSimulatorApp(QMainWindow):
                 motion_config["acceleration_ms"],
                 motion_config["deceleration_ms"],
             )
-            self.lbl_mr_status.setText(
+            self.set_mr_status_text(
                 "MR-MC240N: relative move started "
                 f"({motion_config['distance_mm']:.4f} mm / {distance_counts} command units)"
             )
@@ -2595,7 +2704,7 @@ class ClampSimulatorApp(QMainWindow):
                 motion_config["deceleration_ms"],
             )
             self.position_jog_command_active = True
-            self.lbl_mr_status.setText(f"MR-MC240N: JOG {direction_text} running")
+            self.set_mr_status_text(f"MR-MC240N: JOG {direction_text} running")
         except Exception as exc:
             self.position_jog_command_active = False
             self.handle_position_command_error(f"JOG {direction_text}", exc)
@@ -2606,7 +2715,7 @@ class ClampSimulatorApp(QMainWindow):
         try:
             controller = self.get_position_controller(require_armed=False)
             controller.stop_jog()
-            self.lbl_mr_status.setText("MR-MC240N: JOG stopped")
+            self.set_mr_status_text("MR-MC240N: JOG stopped")
         except Exception as exc:
             self.handle_position_command_error("JOG stop", exc)
         finally:
@@ -2618,7 +2727,7 @@ class ClampSimulatorApp(QMainWindow):
             controller = self.get_position_controller(require_armed=False)
             controller.stop(rapid=rapid)
             self.position_jog_command_active = False
-            self.lbl_mr_status.setText(f"MR-MC240N: {action} completed")
+            self.set_mr_status_text(f"MR-MC240N: {action} completed")
         except Exception as exc:
             self.handle_position_command_error(action, exc)
 
@@ -2714,7 +2823,7 @@ class ClampSimulatorApp(QMainWindow):
                         )
 
             if selected_summary:
-                self.lbl_mr_status.setText(selected_summary)
+                self.set_mr_status_text(selected_summary)
         except Exception as exc:
             self.handle_position_command_error("Axis status refresh", exc)
 
@@ -2734,6 +2843,7 @@ class ClampSimulatorApp(QMainWindow):
         except Exception as exc:
             self.close_ni_daq_task()
             self.close_position_monitor()
+            self.append_system_log(f"실장비 연결 실패: {exc}", "HARDWARE")
             QMessageBox.warning(self, "Hardware Connection Error", f"실장비 연결에 실패했습니다.\n{exc}")
             return
 
@@ -2757,6 +2867,7 @@ class ClampSimulatorApp(QMainWindow):
         self.btn_start.setText("Stop FC400 / USB-6002 Monitoring")
         self.btn_start.setStyleSheet("background-color: #f44336; color: white; font-weight: bold; padding: 10px;")
         self.lbl_status.setText("Status: LIVE (실장비 모니터링)")
+        self.append_system_log("FC400 / USB-6002 live monitoring started", "TEST")
         self.timer.start(self.timer_interval)
         self.live_step()
 
@@ -2768,6 +2879,7 @@ class ClampSimulatorApp(QMainWindow):
             live_voltage = measurement["voltage"]
         except Exception as exc:
             self.stop_simulation(completed=False, source_override=FC400_SOURCE)
+            self.append_system_log(f"하중 읽기 실패: {exc}", "FC400")
             QMessageBox.critical(
                 self, "FC400 Read Error", f"하중 값을 읽지 못했습니다.\n{exc}"
             )
@@ -2777,6 +2889,7 @@ class ClampSimulatorApp(QMainWindow):
             position_mm, position_counts = self.read_position_feedback()
         except Exception as exc:
             self.stop_simulation(completed=False, source_override=FC400_SOURCE)
+            self.append_system_log(f"위치 읽기 실패: {exc}", "MR-MC240N")
             QMessageBox.critical(self, "MR-MC240N Read Error", f"위치 값을 읽지 못했습니다.\n{exc}")
             return
 
@@ -2867,6 +2980,7 @@ class ClampSimulatorApp(QMainWindow):
             try:
                 current_value = self.read_fc400_measurement()["value"]
             except Exception as exc:
+                self.append_system_log(f"로드셀 영점 설정 실패: {exc}", "FC400")
                 QMessageBox.warning(
                     self,
                     "FC400 Zero Error",
@@ -2887,7 +3001,7 @@ class ClampSimulatorApp(QMainWindow):
                     self.latest_live_position_mm = 0.0
                     self.latest_live_position_counts = current_position_counts
                 except Exception as exc:
-                    self.lbl_mr_status.setText(f"MR-MC240N: 위치 영점은 유지됨 - {exc}")
+                    self.set_mr_status_text(f"MR-MC240N: 위치 영점은 유지됨 - {exc}")
         else:
             self.raw_data = [0.0] * 6
             self.sensor_zeros = [0.0] * 6
@@ -2899,6 +3013,7 @@ class ClampSimulatorApp(QMainWindow):
         self.lbl_status.setText(status_text)
         self.update_table()
         self.update_chart(reset_scale=True)
+        self.append_system_log(message_text, "TEST")
         QMessageBox.information(self, "Zeroed", message_text)
 
     def update_table(self):
@@ -2937,6 +3052,7 @@ class ClampSimulatorApp(QMainWindow):
             self.close_position_monitor()
             self.ensure_export_snapshot()
             self.lbl_status.setText("Status: FC400 / USB-6002 Monitoring Stopped")
+            self.append_system_log("FC400 / USB-6002 live monitoring stopped", "TEST")
             self.update_table()
             self.update_chart()
             return
@@ -2945,8 +3061,15 @@ class ClampSimulatorApp(QMainWindow):
             if len(self.stroke_data_history) > 0:
                 self.raw_data = [val + self.sensor_zeros[i] for i, val in enumerate(self.stroke_data_history[-1])]
             self.lbl_status.setText(f"Status: Test Completed ({len(self.stroke_data_history)} Strokes)")
+            self.append_system_log(
+                f"Test completed ({len(self.stroke_data_history)} strokes)", "TEST"
+            )
         else:
             self.lbl_status.setText(f"Status: Stopped ({self.current_stroke} / {self.target_strokes} Strokes)")
+            self.append_system_log(
+                f"Test stopped ({self.current_stroke} / {self.target_strokes} strokes)",
+                "TEST",
+            )
         self.update_table()
         self.update_chart()
 
@@ -2961,6 +3084,7 @@ class ClampSimulatorApp(QMainWindow):
                 self.target_load = float(self.in_load.text())
                 self.hold_time = float(self.in_hold.text())
             except ValueError:
+                self.append_system_log("시험 입력값이 올바르지 않습니다", "TEST")
                 QMessageBox.warning(self, "Input Error", "숫자를 정확히 입력해주세요.")
                 return
 
@@ -2989,6 +3113,11 @@ class ClampSimulatorApp(QMainWindow):
             self.btn_start.setText("Stop Simulation")
             self.btn_start.setStyleSheet("background-color: #f44336; color: white; font-weight: bold; padding: 10px;")
             self.lbl_status.setText(f"Status: PULLING ({self.current_stroke} / {self.target_strokes} Strokes)")
+            self.append_system_log(
+                f"Simulation started: {self.target_strokes} strokes, "
+                f"target {self.target_load:.2f} {self.unit}, hold {self.hold_time:.2f} s",
+                "TEST",
+            )
             self.timer.start(self.timer_interval)
         else:
             self.stop_simulation(completed=False)
@@ -3073,6 +3202,7 @@ class ClampSimulatorApp(QMainWindow):
     def export_csv(self):
         self.ensure_export_snapshot()
         if len(self.stroke_data_history) == 0:
+            self.append_system_log("CSV 저장 실패: 저장할 테스트 데이터가 없습니다", "EXPORT")
             QMessageBox.warning(self, "No Data", "저장할 테스트 데이터가 없습니다.")
             return
 
@@ -3134,11 +3264,13 @@ class ClampSimulatorApp(QMainWindow):
             # 모드를 'a'(Append)로 설정하여 기존 CSV 파일 아래에 이어서 작성
             df_ts.to_csv(file_name, mode='a', index=False, encoding='utf-8-sig')
 
+            self.append_system_log(f"CSV saved: {file_name}", "EXPORT")
             QMessageBox.information(self, "Saved", f"CSV 파일이 성공적으로 저장되었습니다.\n{file_name}")
 
     def export_pdf(self):
         self.ensure_export_snapshot()
         if len(self.stroke_data_history) == 0:
+            self.append_system_log("PDF 저장 실패: 저장할 테스트 데이터가 없습니다", "EXPORT")
             QMessageBox.warning(self, "No Data", "저장할 테스트 데이터가 없습니다.")
             return
 
@@ -3310,6 +3442,7 @@ class ClampSimulatorApp(QMainWindow):
         fig.savefig(file_name, format='pdf', dpi=300)
         plt.close(fig)
 
+        self.append_system_log(f"PDF saved: {file_name}", "EXPORT")
         QMessageBox.information(self, "Saved", f"A4 성적서가 성공적으로 저장되었습니다.\n{file_name}")
 
     def closeEvent(self, event):
