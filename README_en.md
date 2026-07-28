@@ -4,7 +4,7 @@
 
 Windows/PyQt application for a six-axis clamp test machine.
 
-- Test simulation with CSV export and A4 PDF reports
+- Automated FC400/MR-MC240N hardware strokes with CSV and A4 PDF reports
 - UNIPULSE FC400 voltage output through an NI USB-6002
 - Mitsubishi MR-MC240N USB position feedback and guarded motion
 - UVC camera/OpenCV ring-profile measurement
@@ -23,7 +23,8 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
-Simulation mode works without the hardware drivers.
+Running a test requires NI-DAQmx, an NI USB-6002, an MR-MC240N, and the
+matching Mitsubishi runtime.
 
 ## Repository layout
 

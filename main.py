@@ -79,8 +79,6 @@ def _sanitize_qt_plugin_env_after_cv2_import():
 
 _sanitize_qt_plugin_env_after_cv2_import()
 
-SIMULATION_SOURCE = "Simulation"
-FC400_SOURCE = "FC400 analog via NI USB-6002"
 CAMERA_RING_COLOR_PROFILES = {
     "silver": {
         "label": "Silver / 은색",
@@ -268,24 +266,21 @@ class SpiderChartCanvas(FigureCanvas):
         self.ax.scatter(self.angles, data, color='red', s=40, zorder=5)
         self.draw()
 
-class ClampSimulatorApp(QMainWindow):
+class ClampTestMachineApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("6-Axis Clamp Test Machine Simulator")
+        self.setWindowTitle("6-Axis Clamp Test Machine")
         self.configure_window_geometry()
         self.unit = "kgf"
 
-        self.is_simulating = False
-        self.sim_state = "IDLE"
+        self.is_test_running = False
+        self.test_state = "IDLE"
         self.current_stroke = 0
         self.target_strokes = 3
         self.target_load = 10.0
         self.hold_time = 5.0
-        self.hold_ticks = 0
-        self.sim_current_load = 0.0
         self.timer_interval = 100
-        self.input_source = SIMULATION_SOURCE
-        self.data_unit = "kgf"
+        self.data_unit = "N"
 
         self.sensor_zeros = [0.0] * 6
         self.raw_data = [0.0] * 6
@@ -296,6 +291,17 @@ class ClampSimulatorApp(QMainWindow):
         self.latest_live_position_mm = None
         self.latest_live_position_counts = None
         self.position_zero_offset_mm = 0.0
+        self.fc400_device_ready = False
+        self.fc400_readiness_detail = "NI device not checked"
+        self.position_axis_status_checked = False
+        self.position_axis_ready = False
+        self.position_readiness_detail = "MR-MC240N not checked"
+        self.live_motion_cycle_active = False
+        self.live_motion_config = None
+        self.live_motion_target_mm = None
+        self.live_motion_deadline = 0.0
+        self.live_hold_deadline = 0.0
+        self.live_stroke_peak_values = None
         self.camera_capture = None
         self.camera_capture_thread = None
         self.camera_capture_stop_event = threading.Event()
@@ -424,6 +430,9 @@ class ClampSimulatorApp(QMainWindow):
         layout_params.addWidget(self.in_max_len, 1, 1)
         layout_params.addWidget(QLabel("Speed (mm/min):"), 2, 0)
         self.in_speed = QLineEdit("10")
+        self.in_speed.setToolTip(
+            "실장비 자동 시험에서는 MR-MC240N 이동 속도(mm/min)로 사용됩니다."
+        )
         layout_params.addWidget(self.in_speed, 2, 1)
         layout_params.addWidget(QLabel("Hold Time (sec):"), 3, 0)
         self.in_hold = QLineEdit("5.0")
@@ -433,9 +442,13 @@ class ClampSimulatorApp(QMainWindow):
         layout_params.addWidget(self.in_load, 4, 1)
         layout_params.addWidget(QLabel("Operation Strokes:"), 5, 0)
         self.in_strokes = QLineEdit("3")
+        self.in_strokes.setToolTip(
+            "MR-MC240N 사용 시 1 Stroke는 Min → Max → Hold → Min 왕복 1회입니다."
+        )
         layout_params.addWidget(self.in_strokes, 5, 1)
-        self.lbl_status = QLabel("Status: Ready")
-        self.lbl_status.setStyleSheet("color: blue; font-weight: bold;")
+        self.lbl_status = QLabel("Status: NOT READY (Hardware not checked)")
+        self.lbl_status.setWordWrap(True)
+        self.lbl_status.setStyleSheet("color: #C62828; font-weight: bold;")
         layout_params.addWidget(self.lbl_status, 6, 0, 1, 2)
         group_params.setLayout(layout_params)
         left_layout.addWidget(group_params, 1, 0)
@@ -444,6 +457,7 @@ class ClampSimulatorApp(QMainWindow):
         layout_settings = QVBoxLayout()
         self.unit_combo = QComboBox()
         self.unit_combo.addItems(["kgf", "N"])
+        self.unit_combo.setCurrentText("N")
         self.unit_combo.currentTextChanged.connect(self.change_unit)
         layout_settings.addWidget(QLabel("Unit Selection:"))
         layout_settings.addWidget(self.unit_combo)
@@ -460,33 +474,6 @@ class ClampSimulatorApp(QMainWindow):
         group_settings.setLayout(layout_settings)
         left_layout.addWidget(group_settings, 1, 1)
 
-        group_source = QGroupBox("Input")
-        group_source.setMaximumHeight(100)
-        layout_source = QVBoxLayout(group_source)
-        source_button_layout = QHBoxLayout()
-        source_button_layout.setSpacing(8)
-        self.source_buttons = {}
-        source_button_specs = [
-            ("Simulation", SIMULATION_SOURCE),
-            ("FC400 + USB-6002", FC400_SOURCE),
-        ]
-        for button_label, source_name in source_button_specs:
-            button = QPushButton(button_label)
-            button.setCheckable(True)
-            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            button.setMinimumHeight(34)
-            button.setStyleSheet(
-                "QPushButton {padding: 8px 10px; background-color: #F5F7FA; border: 1px solid #B8C1CC;}"
-                "QPushButton:checked {background-color: #1976D2; color: white; border: 1px solid #0D47A1;}"
-            )
-            button.clicked.connect(
-                lambda _checked, selected_source=source_name: self.on_input_source_button_clicked(selected_source)
-            )
-            self.source_buttons[source_name] = button
-            source_button_layout.addWidget(button)
-        layout_source.addLayout(source_button_layout)
-        left_layout.addWidget(group_source, 2, 0, 1, 2)
-
         group_fc400 = QGroupBox("FC400 / USB-6002")
         group_fc400.setMaximumHeight(220)
         layout_fc400 = QGridLayout()
@@ -496,6 +483,7 @@ class ClampSimulatorApp(QMainWindow):
 
         layout_fc400.addWidget(QLabel("Physical Channel:"), 0, 0)
         self.in_fc400_daq_channel = QLineEdit("Dev1/ai0")
+        self.in_fc400_daq_channel.editingFinished.connect(self.refresh_ni_devices)
         layout_fc400.addWidget(self.in_fc400_daq_channel, 0, 1)
 
         layout_fc400.addWidget(QLabel("Terminal Mode:"), 0, 2)
@@ -538,7 +526,7 @@ class ClampSimulatorApp(QMainWindow):
         self._fc400_status_text = init_fc400_status
 
         group_fc400.setLayout(layout_fc400)
-        left_layout.addWidget(group_fc400, 3, 0, 1, 2)
+        left_layout.addWidget(group_fc400, 2, 0, 1, 2)
 
         group_position = QGroupBox("MR-MC240N 6-Axis")
         layout_position = QVBoxLayout()
@@ -748,12 +736,12 @@ class ClampSimulatorApp(QMainWindow):
         self.append_system_log(mr_status, "MR-MC240N")
 
         group_position.setLayout(layout_position)
-        left_layout.addWidget(group_position, 0, 2, 5, 1)
+        left_layout.addWidget(group_position, 0, 2, 4, 1)
 
-        self.btn_start = QPushButton("Start Test Simulation")
-        self.btn_start.clicked.connect(self.toggle_simulation)
+        self.btn_start = QPushButton("Start FC400 + MR-MC240N Test")
+        self.btn_start.clicked.connect(self.toggle_test)
         self.btn_start.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 10px;")
-        left_layout.addWidget(self.btn_start, 4, 0, 1, 2)
+        left_layout.addWidget(self.btn_start, 3, 0, 1, 2)
         for widget_type in (QLineEdit, QPushButton, QComboBox, QCheckBox):
             for widget in left_container.findChildren(widget_type):
                 policy = widget.sizePolicy()
@@ -876,7 +864,7 @@ class ClampSimulatorApp(QMainWindow):
         self.on_position_monitor_toggled(False)
         self.update_table_headers()
         self.update_chart()
-        self.on_input_source_changed(self.input_source)
+        self.refresh_ni_devices()
         self.update_camera_button_state()
         self.update_ring_metrics_label()
 
@@ -1942,12 +1930,6 @@ class ClampSimulatorApp(QMainWindow):
                 log_row["Ring Max Radial Delta [mm]"] = round(measurement["profile_delta_max_abs_mm"], 3)
                 log_row["Ring Deformation [mm]"] = round(measurement["deformation_mm"], 3)
 
-    def is_fc400_mode(self):
-        return self.input_source == FC400_SOURCE
-
-    def is_live_monitor_mode(self):
-        return self.is_fc400_mode()
-
     def is_position_monitor_enabled(self):
         return self.chk_position_monitor.isChecked()
 
@@ -1960,9 +1942,44 @@ class ClampSimulatorApp(QMainWindow):
         return self.is_position_pcie_enabled() and self.chk_mr_motion_arm.isChecked()
 
     def get_source_data_unit(self):
-        if self.is_fc400_mode():
-            return self.fc400_device_unit_combo.currentText()
-        return "kgf"
+        return self.fc400_device_unit_combo.currentText()
+
+    def update_hardware_readiness_status(self):
+        if not hasattr(self, "lbl_status") or self.is_test_running:
+            return
+
+        ready = False
+        if not NIDAQMX_AVAILABLE:
+            status_text = "Status: NOT READY (NI-DAQmx unavailable)"
+        elif not self.fc400_device_ready:
+            status_text = (
+                f"Status: NOT READY (FC400/USB-6002: "
+                f"{self.fc400_readiness_detail})"
+            )
+        elif self.is_position_monitor_enabled():
+            if self.position_monitor is None:
+                status_text = "Status: NOT READY (MR-MC240N not connected)"
+            elif not self.position_axis_status_checked:
+                status_text = "Status: NOT READY (MR axis status not checked)"
+            elif not self.position_axis_ready:
+                status_text = (
+                    f"Status: NOT READY (MR-MC240N: "
+                    f"{self.position_readiness_detail})"
+                )
+            elif not self.is_position_control_armed():
+                status_text = "Status: NOT READY (Motion commands not armed)"
+            else:
+                ready = True
+                status_text = "Status: READY (FC400 + MR-MC240N)"
+        else:
+            status_text = "Status: NOT READY (MR-MC240N disabled)"
+
+        self.lbl_status.setText(status_text)
+        self.lbl_status.setStyleSheet(
+            f"color: {'#2E7D32' if ready else '#C62828'}; font-weight: bold;"
+        )
+        if hasattr(self, "btn_start"):
+            self.btn_start.setEnabled(ready)
 
     def convert_value_units(self, value, from_unit, to_unit):
         if from_unit == to_unit:
@@ -1989,19 +2006,12 @@ class ClampSimulatorApp(QMainWindow):
             ]
         )
 
-    def update_input_source_buttons(self):
-        for source_name, button in self.source_buttons.items():
-            previous_state = button.blockSignals(True)
-            button.setChecked(source_name == self.input_source)
-            button.blockSignals(previous_state)
-
-    def on_input_source_button_clicked(self, source):
-        if source == self.input_source:
-            self.update_input_source_buttons()
-            return
-        self.on_input_source_changed(source)
-
     def on_position_monitor_toggled(self, enabled):
+        self.position_axis_status_checked = False
+        self.position_axis_ready = False
+        self.position_readiness_detail = (
+            "not connected" if enabled else "position board disabled"
+        )
         configuration_widgets = [
             self.mr_connection_combo,
             self.in_mr_dll_path,
@@ -2048,6 +2058,9 @@ class ClampSimulatorApp(QMainWindow):
             else:
                 self.set_mr_status_text("MR-MC240N: disabled")
         self.update_position_control_state()
+        if hasattr(self, "btn_start") and not self.is_test_running:
+            self.update_start_button_idle_state()
+            self.update_hardware_readiness_status()
 
     def is_position_usb_mode(self):
         return self.mr_connection_combo.currentText() == MR_CONNECTION_USB_MAINTENANCE
@@ -2066,6 +2079,7 @@ class ClampSimulatorApp(QMainWindow):
             self.on_position_monitor_toggled(True)
         else:
             self.update_position_control_state()
+            self.update_hardware_readiness_status()
 
     def on_position_axis_changed(self, _axis_text):
         if not hasattr(self, "chk_mr_motion_arm"):
@@ -2078,6 +2092,7 @@ class ClampSimulatorApp(QMainWindow):
                 f"MR-MC240N: axis {self.in_mr_axis_no.currentText()} selected; reconnect"
             )
         self.update_position_control_state()
+        self.update_hardware_readiness_status()
 
     def on_position_motion_arm_toggled(self, armed):
         if armed and not self.is_position_monitor_enabled():
@@ -2113,12 +2128,15 @@ class ClampSimulatorApp(QMainWindow):
                 return
             self.set_mr_status_text("MR-MC240N: motion commands armed")
         else:
-            if self.position_jog_command_active:
+            if self.live_motion_cycle_active:
+                self.stop_position_motion(True)
+            elif self.position_jog_command_active:
                 self.stop_position_motion(True)
             self.position_jog_command_active = False
             if self.is_position_monitor_enabled():
                 self.set_mr_status_text("MR-MC240N: motion commands disarmed")
         self.update_position_control_state()
+        self.update_hardware_readiness_status()
 
     def update_position_control_state(self):
         enabled = self.is_position_monitor_enabled() and os.name == "nt"
@@ -2179,6 +2197,10 @@ class ClampSimulatorApp(QMainWindow):
             self.refresh_position_axis_status()
         except Exception as exc:
             message = str(exc)
+            self.position_axis_status_checked = False
+            self.position_axis_ready = False
+            self.position_readiness_detail = f"connection failed: {message}"
+            self.update_hardware_readiness_status()
             self.set_mr_status_text(f"MR-MC240N: connection failed - {message}")
             QMessageBox.critical(
                 self,
@@ -2255,9 +2277,8 @@ class ClampSimulatorApp(QMainWindow):
             self.handle_position_command_error("Six-axis preset", exc)
 
     def on_source_configuration_changed(self, *_args):
-        previous_source = getattr(self, "input_source", SIMULATION_SOURCE)
-        if self.is_simulating and self.is_live_monitor_mode():
-            self.stop_simulation(completed=False, source_override=previous_source)
+        if self.is_test_running:
+            self.stop_test(completed=False)
 
         self.data_unit = self.get_source_data_unit()
         self.raw_data = [0.0] * 6
@@ -2265,80 +2286,26 @@ class ClampSimulatorApp(QMainWindow):
         self.update_table_headers()
         self.update_table()
         self.update_chart(reset_scale=True)
+        self.update_hardware_readiness_status()
 
     def update_start_button_idle_state(self):
-        if self.is_fc400_mode():
-            self.btn_start.setText("Start FC400 / USB-6002 Monitoring")
-        else:
-            self.btn_start.setText("Start Test Simulation")
+        self.btn_start.setText("Start FC400 + MR-MC240N Test")
         self.btn_start.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 10px;")
-
-    def on_input_source_changed(self, source):
-        previous_source = getattr(self, "input_source", SIMULATION_SOURCE)
-        if self.is_simulating:
-            self.stop_simulation(completed=False, source_override=previous_source)
-
-        self.input_source = source
-        self.update_input_source_buttons()
-        use_fc400 = self.is_fc400_mode()
-        if (
-            use_fc400
-            and previous_source != FC400_SOURCE
-            and self.unit_combo.currentText() == "kgf"
-            and self.fc400_device_unit_combo.currentText() == "N"
-        ):
-            self.unit_combo.setCurrentText("N")
-
-        fc400_widgets = [
-            self.in_fc400_daq_channel,
-            self.fc400_terminal_combo,
-            self.in_fc400_zero_voltage,
-            self.in_fc400_full_scale_voltage,
-            self.in_fc400_full_scale_load,
-            self.fc400_device_unit_combo,
-            self.in_fc400_sample_rate,
-            self.btn_refresh_fc400_daq,
-        ]
-        for widget in fc400_widgets:
-            widget.setEnabled(use_fc400)
-
-        if use_fc400:
-            self.close_ni_daq_task()
-            self.lbl_status.setText("Status: Ready (FC400 via NI USB-6002)")
-            if not NIDAQMX_AVAILABLE:
-                self.set_fc400_status_text(
-                    f"USB-6002: nidaqmx import failed - {NIDAQMX_IMPORT_ERROR}"
-                )
-            else:
-                self.refresh_ni_devices()
-        else:
-            self.close_ni_daq_task()
-            self.lbl_status.setText("Status: Ready")
-            self.set_fc400_status_text("FC400 / USB-6002 mode disabled")
-
-        self.data_unit = self.get_source_data_unit()
-        self.raw_data = [0.0] * 6
-        self.sensor_zeros = [0.0] * 6
-        self.latest_live_snapshot = [0.0] * 6
-        self.latest_live_position_mm = None
-        self.latest_live_position_counts = None
-        self.position_zero_offset_mm = 0.0
-        self.update_table_headers()
-        self.update_table()
-        self.update_chart(reset_scale=True)
-
-        self.update_start_button_idle_state()
-        self.append_system_log(f"Input source selected: {source}", "TEST")
+        self.update_hardware_readiness_status()
 
     def refresh_ni_devices(self):
         if not NIDAQMX_AVAILABLE:
+            self.fc400_device_ready = False
+            self.fc400_readiness_detail = "NI-DAQmx unavailable"
             self.set_fc400_status_text(
                 f"USB-6002: nidaqmx import failed - {NIDAQMX_IMPORT_ERROR}"
             )
+            self.update_hardware_readiness_status()
             return
 
         try:
             device_summaries = []
+            all_ai_channels = []
             first_ai_channel = None
             for device in System.local().devices:
                 try:
@@ -2349,6 +2316,7 @@ class ClampSimulatorApp(QMainWindow):
                 if not ai_channels:
                     continue
 
+                all_ai_channels.extend(ai_channels)
                 product_type = ""
                 try:
                     product_type = device.product_type
@@ -2365,17 +2333,33 @@ class ClampSimulatorApp(QMainWindow):
             if first_ai_channel and current_channel in default_channels:
                 channel_widget.setText(first_ai_channel)
 
-            if device_summaries:
+            configured_channel = channel_widget.text().strip()
+            self.fc400_device_ready = configured_channel in all_ai_channels
+            if self.fc400_device_ready:
+                self.fc400_readiness_detail = f"{configured_channel} detected"
                 status_text = ", ".join(device_summaries)
                 self.set_fc400_status_text("USB-6002: " + status_text)
+            elif device_summaries:
+                self.fc400_readiness_detail = (
+                    f"configured channel {configured_channel or '(empty)'} not found"
+                )
+                self.set_fc400_status_text(
+                    "USB-6002: "
+                    + ", ".join(device_summaries)
+                    + f"; channel {configured_channel or '(empty)'} not found"
+                )
             else:
+                self.fc400_readiness_detail = "no NI analog-input device found"
                 self.set_fc400_status_text(
                     "USB-6002: no NI analog-input device found"
                 )
         except Exception as exc:
+            self.fc400_device_ready = False
+            self.fc400_readiness_detail = "device scan failed"
             self.set_fc400_status_text(
                 f"USB-6002: device scan failed - {exc}"
             )
+        self.update_hardware_readiness_status()
 
     def close_ni_daq_task(self):
         if self.ni_daq_task is None:
@@ -2425,7 +2409,7 @@ class ClampSimulatorApp(QMainWindow):
                 return float(last_value)
             return float(value)
         finally:
-            if opened_here and not self.is_simulating:
+            if opened_here and not self.is_test_running:
                 self.close_ni_daq_task()
 
     def get_fc400_config(self):
@@ -2487,17 +2471,28 @@ class ClampSimulatorApp(QMainWindow):
             )
             task.in_stream.read_all_avail_samp = True
             task.start()
-        except Exception:
+        except Exception as exc:
             task.close()
+            self.fc400_device_ready = False
+            self.fc400_readiness_detail = "DAQ task open failed"
+            self.set_fc400_status_text(
+                f"FC400 / USB-6002 task open failed - {exc}"
+            )
+            self.update_hardware_readiness_status()
             raise
 
         self.ni_daq_task = task
+        self.fc400_device_ready = True
+        self.fc400_readiness_detail = (
+            f"{config['physical_channel']} task ready"
+        )
         self.data_unit = config["device_unit"]
         self.update_table_headers()
         self.set_fc400_status_text(
             f"FC400 / USB-6002: {config['physical_channel']} "
             f"({config['terminal_mode']}) @ {task.timing.samp_clk_rate:.0f} S/s"
         )
+        self.update_hardware_readiness_status()
 
     def read_fc400_measurement(self):
         opened_here = False
@@ -2520,7 +2515,7 @@ class ClampSimulatorApp(QMainWindow):
                 "voltage": voltage,
             }
         finally:
-            if opened_here and not self.is_simulating:
+            if opened_here and not self.is_test_running:
                 self.close_ni_daq_task()
 
     def get_position_monitor_config(self):
@@ -2591,9 +2586,13 @@ class ClampSimulatorApp(QMainWindow):
             raise
 
         self.position_monitor = monitor
+        self.position_axis_status_checked = False
+        self.position_axis_ready = False
+        self.position_readiness_detail = "axis status not checked"
         self.set_mr_status_text(
             f"MR-MC240N: board {config['board_id']} axis {config['axis_number']} opened"
         )
+        self.update_hardware_readiness_status()
 
     def close_position_monitor(self):
         if self.position_monitor is None:
@@ -2610,6 +2609,14 @@ class ClampSimulatorApp(QMainWindow):
         finally:
             self.position_jog_command_active = False
             self.position_monitor = None
+            self.position_axis_status_checked = False
+            self.position_axis_ready = False
+            self.position_readiness_detail = (
+                "not connected"
+                if self.is_position_monitor_enabled()
+                else "position board disabled"
+            )
+            self.update_hardware_readiness_status()
 
     def read_position_feedback(self):
         if not self.is_position_pcie_enabled():
@@ -2627,7 +2634,7 @@ class ClampSimulatorApp(QMainWindow):
             relative_position_mm = absolute_position_mm - self.position_zero_offset_mm
             return relative_position_mm, raw_counts
         finally:
-            if opened_here and not self.is_simulating:
+            if opened_here and not self.is_test_running:
                 self.close_position_monitor()
 
     def get_position_controller(self, require_armed=True):
@@ -2654,6 +2661,9 @@ class ClampSimulatorApp(QMainWindow):
             self.set_mr_status_text(
                 f"MR-MC240N: {action} command sent to axis {controller.axis_number}"
             )
+            self.refresh_position_axis_status()
+            if enabled:
+                QTimer.singleShot(250, self.refresh_position_axis_status)
         except Exception as exc:
             self.handle_position_command_error(action, exc)
 
@@ -2723,15 +2733,22 @@ class ClampSimulatorApp(QMainWindow):
 
     def stop_position_motion(self, rapid):
         action = "Rapid stop" if rapid else "Stop"
+        automatic_test_active = self.live_motion_cycle_active
         try:
             controller = self.get_position_controller(require_armed=False)
             controller.stop(rapid=rapid)
             self.position_jog_command_active = False
             self.set_mr_status_text(f"MR-MC240N: {action} completed")
+            if automatic_test_active:
+                self.live_motion_cycle_active = False
+                self.stop_test(completed=False)
         except Exception as exc:
             self.handle_position_command_error(action, exc)
 
     def refresh_position_axis_status(self):
+        self.position_axis_status_checked = False
+        self.position_axis_ready = False
+        self.position_readiness_detail = "axis status not checked"
         try:
             controller = self.get_position_controller(require_armed=False)
             config = self.get_position_monitor_config()
@@ -2785,6 +2802,16 @@ class ClampSimulatorApp(QMainWindow):
                     )
 
                     if axis == selected_axis:
+                        self.position_axis_status_checked = True
+                        self.position_axis_ready = short_state == "READY"
+                        self.position_readiness_detail = {
+                            "READY": "axis ready",
+                            "RUNNING": "axis is operating",
+                            "ALARM": "servo/operation alarm",
+                            "WAIT SSCNET": "waiting for SSCNET amplifier response",
+                            "UNCONFIGURED": "axis not mounted/configured",
+                            "NOT READY": "servo not ready",
+                        }.get(short_state, short_state.lower())
                         state_names = [
                             text
                             for key, text in [
@@ -2818,13 +2845,23 @@ class ClampSimulatorApp(QMainWindow):
                         "border-radius: 4px; padding: 5px; }"
                     )
                     if axis == selected_axis:
+                        self.position_axis_status_checked = False
+                        self.position_axis_ready = False
+                        self.position_readiness_detail = (
+                            f"axis status read failed: {axis_exc}"
+                        )
                         selected_summary = (
                             f"MR-MC240N axis {axis}: status read failed - {axis_exc}"
                         )
 
             if selected_summary:
                 self.set_mr_status_text(selected_summary)
+            self.update_hardware_readiness_status()
         except Exception as exc:
+            self.position_axis_status_checked = False
+            self.position_axis_ready = False
+            self.position_readiness_detail = f"axis status refresh failed: {exc}"
+            self.update_hardware_readiness_status()
             self.handle_position_command_error("Axis status refresh", exc)
 
     def get_default_stroke_mm(self):
@@ -2833,13 +2870,306 @@ class ClampSimulatorApp(QMainWindow):
         except ValueError:
             return 0.0
 
-    def start_live_monitoring(self):
+    def get_live_motion_test_config(self):
+        if not self.is_position_monitor_enabled():
+            raise RuntimeError(
+                "MR-MC240N position board를 활성화해주세요."
+            )
+        if not self.is_position_control_armed():
+            raise RuntimeError(
+                "MR-MC240N 자동 왕복 시험을 시작하려면 Arm motion commands를 활성화해주세요."
+            )
+
+        minimum_mm = float(self.in_min_len.text())
+        maximum_mm = float(self.in_max_len.text())
+        speed_mm_min = float(self.in_speed.text())
+        hold_seconds = float(self.in_hold.text())
+        target_load = float(self.in_load.text())
+        target_strokes = int(self.in_strokes.text())
+        acceleration_ms = int(self.in_mr_acceleration_ms.text())
+        deceleration_ms = int(self.in_mr_deceleration_ms.text())
+        position_config = self.get_position_monitor_config()
+
+        if maximum_mm <= minimum_mm:
+            raise ValueError("Max Length는 Min Length보다 커야 합니다.")
+        if speed_mm_min < 1:
+            raise ValueError("Speed는 1 mm/min 이상이어야 합니다.")
+        board_speed = int(round(speed_mm_min))
+        if abs(speed_mm_min - board_speed) > 1e-9:
+            raise ValueError(
+                "MR-MC240N 속도 명령은 정수 단위입니다. Speed를 정수 mm/min으로 입력해주세요."
+            )
+        max_speed = 12_000 if self.is_position_usb_mode() else 2_147_483_647
+        if board_speed > max_speed:
+            raise ValueError(f"Speed는 1~{max_speed} mm/min 범위여야 합니다.")
+        if not 0 <= acceleration_ms <= 20_000:
+            raise ValueError("Acceleration은 0~20000 ms 범위로 입력해주세요.")
+        if not 0 <= deceleration_ms <= 20_000:
+            raise ValueError("Deceleration은 0~20000 ms 범위로 입력해주세요.")
+        if hold_seconds < 0:
+            raise ValueError("Hold Time은 0초 이상이어야 합니다.")
+        if target_load < 0:
+            raise ValueError("Target Load는 0 이상이어야 합니다.")
+        if target_strokes < 1:
+            raise ValueError("Operation Strokes는 1 이상이어야 합니다.")
+
+        counts_per_mm = position_config["counts_per_mm"]
+        tolerance_mm = max(0.01, 2.0 / counts_per_mm)
+        return {
+            "minimum_mm": minimum_mm,
+            "maximum_mm": maximum_mm,
+            "stroke_span_mm": maximum_mm - minimum_mm,
+            "speed_mm_min": board_speed,
+            "hold_seconds": hold_seconds,
+            "target_load": target_load,
+            "target_strokes": target_strokes,
+            "acceleration_ms": acceleration_ms,
+            "deceleration_ms": deceleration_ms,
+            "counts_per_mm": counts_per_mm,
+            "tolerance_mm": tolerance_mm,
+        }
+
+    def validate_live_motion_axis(self, controller, motion_config):
+        axis_status = controller.read_axis_status()
+        if axis_status.get("servo_alarm") or axis_status.get("operation_alarm"):
+            raise RuntimeError("선택 축에 Servo/Operation alarm이 있습니다.")
+        if axis_status.get("operating"):
+            raise RuntimeError("선택 축이 이미 운전 중입니다.")
+        if not axis_status.get("servo_ready"):
+            raise RuntimeError(
+                "선택 축이 Servo Ready 상태가 아닙니다. Servo ON 후 다시 시작해주세요."
+            )
+
+        raw_counts = int(axis_status["position"])
+        current_position_mm = (
+            raw_counts / motion_config["counts_per_mm"]
+        ) - self.position_zero_offset_mm
+        allowed_margin_mm = max(1.0, motion_config["stroke_span_mm"] * 0.05)
+        if not (
+            motion_config["minimum_mm"] - allowed_margin_mm
+            <= current_position_mm
+            <= motion_config["maximum_mm"] + allowed_margin_mm
+        ):
+            raise RuntimeError(
+                f"현재 위치 {current_position_mm:.3f} mm가 시험 범위 "
+                f"{motion_config['minimum_mm']:.3f}~{motion_config['maximum_mm']:.3f} mm에서 "
+                "너무 멉니다. 위치 영점 또는 시험 범위를 확인해주세요."
+            )
+        return current_position_mm, raw_counts
+
+    def start_live_motion_move(self, target_mm, state, current_position_mm=None):
+        controller = self.get_position_controller(require_armed=True)
+        config = self.live_motion_config
+        if config is None:
+            raise RuntimeError("자동 왕복 시험 설정이 없습니다.")
+
+        if current_position_mm is None:
+            current_position_mm, _ = self.read_position_feedback()
+        if current_position_mm is None:
+            raise RuntimeError("MR-MC240N 현재 위치를 읽지 못했습니다.")
+
+        distance_mm = target_mm - current_position_mm
+        if abs(distance_mm) > (
+            config["stroke_span_mm"] + max(1.0, config["tolerance_mm"] * 5)
+        ):
+            raise RuntimeError(
+                f"요청 이동량 {distance_mm:.3f} mm가 설정 Stroke 범위를 초과합니다."
+            )
+
+        self.test_state = state
+        self.live_motion_target_mm = target_mm
+        expected_seconds = abs(distance_mm) / config["speed_mm_min"] * 60.0
+        self.live_motion_deadline = time.monotonic() + max(
+            10.0,
+            expected_seconds * 2.0
+            + (config["acceleration_ms"] + config["deceleration_ms"]) / 1000.0
+            + 5.0,
+        )
+
+        if abs(distance_mm) <= config["tolerance_mm"]:
+            return
+
+        distance_counts = round(distance_mm * config["counts_per_mm"])
+        if distance_counts == 0:
+            raise RuntimeError("이동량이 1 command unit 미만입니다.")
+        controller.move_relative(
+            distance_counts,
+            config["speed_mm_min"],
+            config["acceleration_ms"],
+            config["deceleration_ms"],
+        )
+        self.append_system_log(
+            f"{state}: axis {controller.axis_number}, "
+            f"{current_position_mm:.3f} → {target_mm:.3f} mm "
+            f"({distance_counts} cmd, {config['speed_mm_min']} mm/min)",
+            "MR-MC240N",
+        )
+
+    def begin_live_motion_cycle(self, current_position_mm):
+        config = self.live_motion_config
+        self.live_motion_cycle_active = True
+        self.current_stroke = 0
+        self.live_stroke_peak_values = None
+
+        if (
+            abs(current_position_mm - config["minimum_mm"])
+            <= config["tolerance_mm"]
+        ):
+            self.start_live_motion_move(
+                config["maximum_mm"],
+                "MOVING_TO_MAX",
+                current_position_mm,
+            )
+        else:
+            self.start_live_motion_move(
+                config["minimum_mm"],
+                "POSITIONING_MIN",
+                current_position_mm,
+            )
+
+    def update_live_stroke_peak(self, calibrated_values):
+        if self.live_stroke_peak_values is None:
+            self.live_stroke_peak_values = list(calibrated_values)
+            return
+        self.live_stroke_peak_values = [
+            max(previous, current)
+            for previous, current in zip(
+                self.live_stroke_peak_values,
+                calibrated_values,
+            )
+        ]
+
+    def record_live_motion_stroke(self):
+        if self.live_stroke_peak_values is None:
+            calibrated_values = [
+                max(0, self.raw_data[index] - self.sensor_zeros[index])
+                for index in range(6)
+            ]
+        else:
+            calibrated_values = self.live_stroke_peak_values
+        self.stroke_data_history.append(list(calibrated_values))
+        self.stroke_position_history.append(self.live_motion_config["maximum_mm"])
+
+    def update_live_motion_cycle(self, position_mm, calibrated_values):
+        if not self.live_motion_cycle_active:
+            return False
+
+        config = self.live_motion_config
+        now = time.monotonic()
+        if self.test_state in {"MOVING_TO_MAX", "HOLDING_MAX"}:
+            self.update_live_stroke_peak(calibrated_values)
+
+        if self.test_state == "HOLDING_MAX":
+            if now < self.live_hold_deadline:
+                return False
+            self.record_live_motion_stroke()
+            self.start_live_motion_move(
+                config["minimum_mm"],
+                "MOVING_TO_MIN",
+                position_mm,
+            )
+            return False
+
+        controller = self.get_position_controller(require_armed=True)
+        axis_status = controller.read_axis_status()
+        if axis_status.get("servo_alarm") or axis_status.get("operation_alarm"):
+            raise RuntimeError("자동 왕복 중 Servo/Operation alarm이 발생했습니다.")
+        if now > self.live_motion_deadline:
+            raise TimeoutError(
+                f"{self.test_state} 제한시간을 초과했습니다 "
+                f"(현재 {position_mm:.3f} mm / 목표 {self.live_motion_target_mm:.3f} mm)."
+            )
+
+        target_reached = (
+            abs(position_mm - self.live_motion_target_mm)
+            <= config["tolerance_mm"]
+        )
+        operation_finished = (
+            not axis_status.get("operating", False)
+            and (
+                axis_status.get("in_position", False)
+                or axis_status.get("operation_complete", False)
+            )
+        )
+        if not (target_reached and operation_finished):
+            return False
+
+        if self.test_state == "POSITIONING_MIN":
+            self.live_stroke_peak_values = None
+            self.start_live_motion_move(
+                config["maximum_mm"],
+                "MOVING_TO_MAX",
+                position_mm,
+            )
+            return False
+
+        if self.test_state == "MOVING_TO_MAX":
+            self.test_state = "HOLDING_MAX"
+            self.live_hold_deadline = now + config["hold_seconds"]
+            self.append_system_log(
+                f"Stroke {self.current_stroke + 1}/{config['target_strokes']}: "
+                f"Max Length 도달, {config['hold_seconds']:.2f} s 유지",
+                "TEST",
+            )
+            return False
+
+        if self.test_state == "MOVING_TO_MIN":
+            self.current_stroke += 1
+            self.append_system_log(
+                f"Stroke {self.current_stroke}/{config['target_strokes']} completed",
+                "TEST",
+            )
+            if self.current_stroke >= config["target_strokes"]:
+                self.live_motion_cycle_active = False
+                self.stop_test(completed=True)
+                QMessageBox.information(
+                    self,
+                    "Test Complete",
+                    f"{config['target_strokes']} Strokes 실장비 시험이 완료되었습니다.",
+                )
+                return True
+
+            self.live_stroke_peak_values = None
+            self.start_live_motion_move(
+                config["maximum_mm"],
+                "MOVING_TO_MAX",
+                position_mm,
+            )
+        return False
+
+    def abort_live_motion_test(self, message):
+        self.append_system_log(message, "MR-MC240N")
+        controller = self.position_monitor
+        if controller is not None:
+            try:
+                controller.stop(rapid=True, timeout_ms=3000)
+                self.append_system_log(
+                    "자동 왕복 중단: Rapid stop command sent",
+                    "MR-MC240N",
+                )
+            except Exception as stop_exc:
+                self.append_system_log(
+                    f"Rapid stop 실패: {stop_exc}",
+                    "MR-MC240N",
+                )
+        self.live_motion_cycle_active = False
+        self.stop_test(completed=False)
+        QMessageBox.critical(self, "MR-MC240N Automatic Test Error", message)
+
+    def start_hardware_test(self):
+        motion_config = None
+        initial_position_mm = None
+        initial_position_counts = None
         try:
-            if self.is_fc400_mode():
-                self.open_fc400_usb_task()
-                self.data_unit = self.get_fc400_config()["device_unit"]
-            if self.is_position_pcie_enabled():
-                self.open_position_monitor()
+            motion_config = self.get_live_motion_test_config()
+            self.open_fc400_usb_task()
+            self.data_unit = self.get_fc400_config()["device_unit"]
+            self.open_position_monitor()
+            controller = self.get_position_controller(require_armed=True)
+            (
+                initial_position_mm,
+                initial_position_counts,
+            ) = self.validate_live_motion_axis(controller, motion_config)
         except Exception as exc:
             self.close_ni_daq_task()
             self.close_position_monitor()
@@ -2847,15 +3177,20 @@ class ClampSimulatorApp(QMainWindow):
             QMessageBox.warning(self, "Hardware Connection Error", f"실장비 연결에 실패했습니다.\n{exc}")
             return
 
-        self.is_simulating = True
+        self.is_test_running = True
         self.current_stroke = 0
         self.stroke_data_history = []
         self.stroke_position_history = []
         self.time_series_data = []
         self.time_elapsed = 0.0
         self.latest_live_snapshot = [0.0] * 6
-        self.latest_live_position_mm = None
-        self.latest_live_position_counts = None
+        self.latest_live_position_mm = initial_position_mm
+        self.latest_live_position_counts = initial_position_counts
+        self.live_motion_config = motion_config
+        self.live_motion_target_mm = None
+        self.live_motion_deadline = 0.0
+        self.live_hold_deadline = 0.0
+        self.live_stroke_peak_values = None
         self.update_table_headers()
         self.chart.reset_scale()
 
@@ -2863,22 +3198,55 @@ class ClampSimulatorApp(QMainWindow):
         self.test_start_ts = now.strftime("%Y%m%d_%H%M%S")
         self.test_start_display_time = now.strftime('%Y-%m-%d %H:%M:%S')
 
-        self.sim_state = "LIVE"
-        self.btn_start.setText("Stop FC400 / USB-6002 Monitoring")
+        self.test_state = "LIVE"
+        self.target_strokes = motion_config["target_strokes"]
+        self.target_load = motion_config["target_load"]
+        self.hold_time = motion_config["hold_seconds"]
+        try:
+            self.begin_live_motion_cycle(initial_position_mm)
+        except Exception as exc:
+            self.is_test_running = False
+            self.live_motion_cycle_active = False
+            self.live_motion_config = None
+            self.live_motion_target_mm = None
+            self.close_ni_daq_task()
+            self.close_position_monitor()
+            self.update_start_button_idle_state()
+            self.append_system_log(
+                f"자동 왕복 시작 실패: {exc}",
+                "MR-MC240N",
+            )
+            QMessageBox.critical(
+                self,
+                "MR-MC240N Automatic Test Error",
+                f"자동 왕복 시험을 시작하지 못했습니다.\n{exc}",
+            )
+            return
+        self.btn_start.setText("Stop FC400 + MR-MC240N Test")
         self.btn_start.setStyleSheet("background-color: #f44336; color: white; font-weight: bold; padding: 10px;")
-        self.lbl_status.setText("Status: LIVE (실장비 모니터링)")
-        self.append_system_log("FC400 / USB-6002 live monitoring started", "TEST")
+        self.btn_start.setEnabled(True)
+        self.lbl_status.setStyleSheet("color: #1565C0; font-weight: bold;")
+        self.lbl_status.setText(
+            f"Status: {self.test_state} (0 / {self.target_strokes} Strokes)"
+        )
+        self.append_system_log(
+            "FC400 + MR-MC240N automatic test started: "
+            f"{motion_config['minimum_mm']:.3f}↔{motion_config['maximum_mm']:.3f} mm, "
+            f"{motion_config['speed_mm_min']} mm/min, "
+            f"{motion_config['target_strokes']} strokes",
+            "TEST",
+        )
         self.timer.start(self.timer_interval)
-        self.live_step()
+        self.hardware_test_step()
 
-    def live_step(self):
+    def hardware_test_step(self):
         try:
             measurement = self.read_fc400_measurement()
             load_value = measurement["value"]
             live_stable = measurement["stable"]
             live_voltage = measurement["voltage"]
         except Exception as exc:
-            self.stop_simulation(completed=False, source_override=FC400_SOURCE)
+            self.stop_test(completed=False)
             self.append_system_log(f"하중 읽기 실패: {exc}", "FC400")
             QMessageBox.critical(
                 self, "FC400 Read Error", f"하중 값을 읽지 못했습니다.\n{exc}"
@@ -2888,7 +3256,7 @@ class ClampSimulatorApp(QMainWindow):
         try:
             position_mm, position_counts = self.read_position_feedback()
         except Exception as exc:
-            self.stop_simulation(completed=False, source_override=FC400_SOURCE)
+            self.stop_test(completed=False)
             self.append_system_log(f"위치 읽기 실패: {exc}", "MR-MC240N")
             QMessageBox.critical(self, "MR-MC240N Read Error", f"위치 값을 읽지 못했습니다.\n{exc}")
             return
@@ -2910,8 +3278,12 @@ class ClampSimulatorApp(QMainWindow):
 
         log_row = {
             'Time [sec]': round(self.time_elapsed, 1),
-            'Stroke': 1,
-            'State': 'LIVE'
+            'Stroke': (
+                min(self.current_stroke + 1, self.target_strokes)
+                if self.live_motion_cycle_active
+                else 1
+            ),
+            'State': self.test_state,
         }
         if position_mm is not None:
             log_row['Position [mm]'] = round(position_mm, 3)
@@ -2929,8 +3301,27 @@ class ClampSimulatorApp(QMainWindow):
         self.append_camera_metrics_to_log_row(log_row)
         self.time_series_data.append(log_row)
 
+        if self.live_motion_cycle_active:
+            try:
+                test_stopped = self.update_live_motion_cycle(
+                    position_mm,
+                    current_calibrated_base,
+                )
+            except Exception as exc:
+                self.abort_live_motion_test(f"자동 왕복 시험 실패: {exc}")
+                return
+            if test_stopped:
+                return
+
         source_name = "FC400"
-        if position_mm is not None:
+        if self.live_motion_cycle_active and position_mm is not None:
+            self.lbl_status.setText(
+                f"Status: {self.test_state} "
+                f"({self.current_stroke} / {self.target_strokes} Strokes, "
+                f"{source_name} {current_calibrated_display[0]:.2f} {self.unit}, "
+                f"{position_mm:.3f} mm)"
+            )
+        elif position_mm is not None:
             self.lbl_status.setText(
                 f"Status: LIVE ({source_name} {current_calibrated_display[0]:.2f} {self.unit}, Stroke {position_mm:.3f} mm)"
             )
@@ -2940,15 +3331,12 @@ class ClampSimulatorApp(QMainWindow):
             )
 
     def timer_step(self):
-        if self.is_live_monitor_mode():
-            self.live_step()
-        else:
-            self.simulation_step()
+        self.hardware_test_step()
 
     def ensure_export_snapshot(self):
         if self.stroke_data_history:
             return
-        if self.is_live_monitor_mode() and len(self.time_series_data) > 0:
+        if len(self.time_series_data) > 0:
             self.stroke_data_history = [self.latest_live_snapshot.copy()]
             snapshot_mm = (
                 self.latest_live_position_mm
@@ -2964,6 +3352,14 @@ class ClampSimulatorApp(QMainWindow):
         self.update_chart(reset_scale=True)
 
     def zero_sensors(self):
+        if self.is_test_running:
+            QMessageBox.warning(
+                self,
+                "Test Running",
+                "시험을 중지한 뒤 영점을 설정해주세요.",
+            )
+            return
+
         # 모든 물리적 데이터, 영점 기준, 그리고 이전 테스트 기록과 시계열 데이터 완전히 리셋
         self.stroke_data_history = []
         self.stroke_position_history = []
@@ -2976,43 +3372,38 @@ class ClampSimulatorApp(QMainWindow):
         self.test_start_ts = None
         self.test_start_display_time = None
 
-        if self.is_live_monitor_mode():
+        try:
+            current_value = self.read_fc400_measurement()["value"]
+        except Exception as exc:
+            self.fc400_device_ready = False
+            self.fc400_readiness_detail = "zero read failed"
+            self.update_hardware_readiness_status()
+            self.append_system_log(f"로드셀 영점 설정 실패: {exc}", "FC400")
+            QMessageBox.warning(
+                self,
+                "FC400 Zero Error",
+                f"로드셀 영점 설정에 실패했습니다.\n{exc}",
+            )
+            return
+
+        self.raw_data = [current_value] * 6
+        self.sensor_zeros = self.raw_data.copy()
+        message_text = "로드셀 영점(Tare) 및 이전 데이터 초기화가 완료되었습니다."
+
+        if self.is_position_pcie_enabled():
             try:
-                current_value = self.read_fc400_measurement()["value"]
+                current_position_mm, current_position_counts = self.read_position_feedback()
+                self.position_zero_offset_mm += current_position_mm if current_position_mm is not None else 0.0
+                self.latest_live_position_mm = 0.0
+                self.latest_live_position_counts = current_position_counts
+                if self.position_monitor is not None:
+                    self.refresh_position_axis_status()
             except Exception as exc:
-                self.append_system_log(f"로드셀 영점 설정 실패: {exc}", "FC400")
-                QMessageBox.warning(
-                    self,
-                    "FC400 Zero Error",
-                    f"로드셀 영점 설정에 실패했습니다.\n{exc}",
-                )
-                return
+                self.set_mr_status_text(f"MR-MC240N: 위치 영점은 유지됨 - {exc}")
 
-            self.raw_data = [current_value] * 6
-            self.sensor_zeros = self.raw_data.copy()
-            self.sim_current_load = 0.0
-            status_text = "Status: Ready (Load Cell Tared)"
-            message_text = "로드셀 영점(Tare) 및 이전 데이터 초기화가 완료되었습니다."
-
-            if self.is_position_pcie_enabled():
-                try:
-                    current_position_mm, current_position_counts = self.read_position_feedback()
-                    self.position_zero_offset_mm += current_position_mm if current_position_mm is not None else 0.0
-                    self.latest_live_position_mm = 0.0
-                    self.latest_live_position_counts = current_position_counts
-                except Exception as exc:
-                    self.set_mr_status_text(f"MR-MC240N: 위치 영점은 유지됨 - {exc}")
-        else:
-            self.raw_data = [0.0] * 6
-            self.sensor_zeros = [0.0] * 6
-            self.sim_current_load = 0.0
-            self.position_zero_offset_mm = 0.0
-            status_text = "Status: Ready (Data Reset)"
-            message_text = "센서 영점 맞춤 및 이전 데이터 초기화가 완료되었습니다."
-
-        self.lbl_status.setText(status_text)
         self.update_table()
         self.update_chart(reset_scale=True)
+        self.update_hardware_readiness_status()
         self.append_system_log(message_text, "TEST")
         QMessageBox.information(self, "Zeroed", message_text)
 
@@ -3039,160 +3430,100 @@ class ClampSimulatorApp(QMainWindow):
         interp = self.interp_combo.currentText()
         self.chart.plot_data(data, interpolate_type=interp, unit=self.unit, reset_scale=reset_scale)
 
-    def stop_simulation(self, completed=False, source_override=None):
-        active_source = source_override if source_override is not None else self.input_source
-        using_live_hardware = active_source == FC400_SOURCE
-        self.is_simulating = False
-        self.sim_state = "IDLE"
+    def stop_test(self, completed=False):
+        was_live_motion_test = self.live_motion_config is not None
+        was_live_motion_active = self.live_motion_cycle_active
+        live_motion_strokes = self.current_stroke
+
+        if (
+            was_live_motion_active
+            and self.position_monitor is not None
+        ):
+            try:
+                self.position_monitor.stop(rapid=False, timeout_ms=3000)
+                self.append_system_log(
+                    "Automatic test stop command sent",
+                    "MR-MC240N",
+                )
+            except Exception as exc:
+                self.append_system_log(
+                    f"Automatic test normal stop failed: {exc}",
+                    "MR-MC240N",
+                )
+                try:
+                    self.position_monitor.stop(rapid=True, timeout_ms=3000)
+                    self.append_system_log(
+                        "Automatic test rapid stop command sent",
+                        "MR-MC240N",
+                    )
+                except Exception as rapid_exc:
+                    self.append_system_log(
+                        f"Automatic test rapid stop failed: {rapid_exc}",
+                        "MR-MC240N",
+                    )
+
+        self.is_test_running = False
+        self.test_state = "IDLE"
+        self.live_motion_cycle_active = False
         self.timer.stop()
         self.update_start_button_idle_state()
 
-        if using_live_hardware:
-            self.close_ni_daq_task()
-            self.close_position_monitor()
-            self.ensure_export_snapshot()
+        self.close_ni_daq_task()
+        self.close_position_monitor()
+        self.ensure_export_snapshot()
+        if was_live_motion_test and completed:
+            self.lbl_status.setText(
+                f"Status: Test Completed ({live_motion_strokes} Strokes)"
+            )
+            self.lbl_status.setStyleSheet(
+                "color: #2E7D32; font-weight: bold;"
+            )
+            self.append_system_log(
+                f"FC400 + MR-MC240N test completed "
+                f"({live_motion_strokes} strokes)",
+                "TEST",
+            )
+        elif was_live_motion_test:
+            self.lbl_status.setText(
+                f"Status: Hardware Test Stopped ({live_motion_strokes} Strokes)"
+            )
+            self.lbl_status.setStyleSheet(
+                "color: #1565C0; font-weight: bold;"
+            )
+            self.append_system_log(
+                f"FC400 + MR-MC240N test stopped "
+                f"({live_motion_strokes} strokes)",
+                "TEST",
+            )
+        else:
             self.lbl_status.setText("Status: FC400 / USB-6002 Monitoring Stopped")
-            self.append_system_log("FC400 / USB-6002 live monitoring stopped", "TEST")
-            self.update_table()
-            self.update_chart()
+            self.lbl_status.setStyleSheet(
+                "color: #1565C0; font-weight: bold;"
+            )
+            self.append_system_log(
+                "FC400 / USB-6002 live monitoring stopped",
+                "TEST",
+            )
+        self.live_motion_config = None
+        self.live_motion_target_mm = None
+        self.live_stroke_peak_values = None
+        self.update_table()
+        self.update_chart()
+
+    def toggle_test(self):
+        if self.is_test_running:
+            self.stop_test(completed=False)
             return
 
-        if completed:
-            if len(self.stroke_data_history) > 0:
-                self.raw_data = [val + self.sensor_zeros[i] for i, val in enumerate(self.stroke_data_history[-1])]
-            self.lbl_status.setText(f"Status: Test Completed ({len(self.stroke_data_history)} Strokes)")
-            self.append_system_log(
-                f"Test completed ({len(self.stroke_data_history)} strokes)", "TEST"
+        self.update_hardware_readiness_status()
+        if not self.btn_start.isEnabled():
+            QMessageBox.warning(
+                self,
+                "Hardware Not Ready",
+                self.lbl_status.text().replace("Status: ", ""),
             )
-        else:
-            self.lbl_status.setText(f"Status: Stopped ({self.current_stroke} / {self.target_strokes} Strokes)")
-            self.append_system_log(
-                f"Test stopped ({self.current_stroke} / {self.target_strokes} strokes)",
-                "TEST",
-            )
-        self.update_table()
-        self.update_chart()
-
-    def toggle_simulation(self):
-        if not self.is_simulating:
-            if self.is_live_monitor_mode():
-                self.start_live_monitoring()
-                return
-
-            try:
-                self.target_strokes = int(self.in_strokes.text())
-                self.target_load = float(self.in_load.text())
-                self.hold_time = float(self.in_hold.text())
-            except ValueError:
-                self.append_system_log("시험 입력값이 올바르지 않습니다", "TEST")
-                QMessageBox.warning(self, "Input Error", "숫자를 정확히 입력해주세요.")
-                return
-
-            self.is_simulating = True
-            self.current_stroke = 0
-            self.data_unit = "kgf"
-
-            # 새 테스트 시작 시 이력 리셋
-            self.stroke_data_history = []
-            self.stroke_position_history = []
-            self.time_series_data = []
-            self.time_elapsed = 0.0
-            self.latest_live_position_mm = None
-            self.latest_live_position_counts = None
-            self.position_zero_offset_mm = 0.0
-            self.update_table_headers()
-            self.chart.reset_scale()
-
-            now = datetime.now()
-            self.test_start_ts = now.strftime("%Y%m%d_%H%M%S")
-            self.test_start_display_time = now.strftime('%Y-%m-%d %H:%M:%S')
-
-            self.sim_state = "PULLING"
-            self.sim_current_load = 0.0
-
-            self.btn_start.setText("Stop Simulation")
-            self.btn_start.setStyleSheet("background-color: #f44336; color: white; font-weight: bold; padding: 10px;")
-            self.lbl_status.setText(f"Status: PULLING ({self.current_stroke} / {self.target_strokes} Strokes)")
-            self.append_system_log(
-                f"Simulation started: {self.target_strokes} strokes, "
-                f"target {self.target_load:.2f} {self.unit}, hold {self.hold_time:.2f} s",
-                "TEST",
-            )
-            self.timer.start(self.timer_interval)
-        else:
-            self.stop_simulation(completed=False)
-
-    def simulation_step(self):
-        load_step = self.target_load / (1500 / self.timer_interval)
-
-        # 1. 상태에 따른 하중 논리 갱신
-        if self.sim_state == "PULLING":
-            self.sim_current_load += load_step
-            if self.sim_current_load >= self.target_load:
-                self.sim_current_load = self.target_load
-                self.sim_state = "HOLDING"
-                self.hold_ticks = int((self.hold_time * 1000) / self.timer_interval)
-        elif self.sim_state == "HOLDING":
-            if self.hold_ticks == int((self.hold_time * 1000) / self.timer_interval):
-                calibrated = [(self.raw_data[i] - self.sensor_zeros[i]) for i in range(6)]
-                self.stroke_data_history.append(calibrated)
-                self.stroke_position_history.append(self.get_default_stroke_mm())
-            self.hold_ticks -= 1
-            if self.hold_ticks <= 0:
-                self.sim_state = "RELEASING"
-        elif self.sim_state == "RELEASING":
-            self.sim_current_load -= load_step
-            if self.sim_current_load <= 0:
-                self.sim_current_load = 0.0
-
-        # 2. 물리적 Raw Data 시뮬레이션 적용 및 UI 반영
-        noise = np.random.normal(0, max(0.05, self.target_load * 0.01), 6)
-        dist_factors = [1.0, 0.96, 1.04, 0.98, 1.02, 1.0]
-        for i in range(6):
-            if self.sim_current_load <= 0:
-                val = 0
-            else:
-                val = self.sim_current_load * dist_factors[i] + noise[i]
-            self.raw_data[i] = max(0, val) + self.sensor_zeros[i]
-
-        self.update_table()
-        self.update_chart()
-
-        # 3. 실시간 시계열 데이터 로깅 (Raw 데이터 및 Calibrated 데이터 모두 저장)
-        self.time_elapsed += self.timer_interval / 1000.0
-        current_calibrated = [max(0, self.raw_data[i] - self.sensor_zeros[i]) for i in range(6)]
-        if self.unit == "N":
-            current_calibrated = [v * 9.80665 for v in current_calibrated]
-
-        log_row = {
-            'Time [sec]': round(self.time_elapsed, 1),
-            'Stroke': self.current_stroke + 1 if self.current_stroke < self.target_strokes else self.target_strokes,
-            'State': self.sim_state
-        }
-
-        # 1~6축 Raw Data 추가
-        for i in range(6):
-            log_row[f'Axis {i+1} Raw'] = round(self.raw_data[i], 2)
-
-        # 1~6축 Calibrated Data 추가
-        for i in range(6):
-            log_row[f'Axis {i+1} Calibrated [{self.unit}]'] = round(current_calibrated[i], 2)
-        self.append_camera_metrics_to_log_row(log_row)
-
-        self.time_series_data.append(log_row)
-
-        # 4. 스트로크 완료 여부 체크 및 상태 전환
-        if self.sim_state == "RELEASING" and self.sim_current_load <= 0:
-            self.current_stroke += 1
-            if self.current_stroke >= self.target_strokes:
-                self.stop_simulation(completed=True)
-                QMessageBox.information(self, "Test Complete", f"{self.target_strokes} Strokes 테스트가 완료되었습니다.")
-                return
-            else:
-                self.sim_state = "PULLING"
-
-        if self.is_simulating:
-            self.lbl_status.setText(f"Status: {self.sim_state} ({self.current_stroke} / {self.target_strokes} Strokes)")
+            return
+        self.start_hardware_test()
 
     def get_stroke_position_value(self, index):
         if index < len(self.stroke_position_history):
@@ -3447,8 +3778,11 @@ class ClampSimulatorApp(QMainWindow):
 
     def closeEvent(self, event):
         self.close_camera(reset_status=False)
-        self.close_ni_daq_task()
-        self.close_position_monitor()
+        if self.is_test_running:
+            self.stop_test(completed=False)
+        else:
+            self.close_ni_daq_task()
+            self.close_position_monitor()
         super().closeEvent(event)
 
     def keyPressEvent(self, event):
@@ -3469,6 +3803,6 @@ class ClampSimulatorApp(QMainWindow):
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
-    ex = ClampSimulatorApp()
+    ex = ClampTestMachineApp()
     ex.showMaximized()
     sys.exit(app.exec_())

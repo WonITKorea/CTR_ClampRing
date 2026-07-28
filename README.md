@@ -4,7 +4,7 @@
 
 6축 클램프 시험을 위한 Windows/PyQt 애플리케이션입니다.
 
-- 시험 시뮬레이션, CSV 저장 및 A4 PDF 리포트
+- FC400/MR-MC240N 실장비 자동 Stroke 시험, CSV 저장 및 A4 PDF 리포트
 - UNIPULSE FC400 전압 출력 + NI USB-6002 하중 입력
 - Mitsubishi MR-MC240N USB 위치 피드백 및 6축 구동
 - UVC 카메라/OpenCV 기반 링 형상 측정
@@ -23,7 +23,8 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
-실장비 드라이버가 없어도 `Simulation` 모드는 사용할 수 있습니다.
+시험 실행에는 NI-DAQmx, NI USB-6002, MR-MC240N과 해당 Mitsubishi 런타임이
+필요합니다.
 
 ## 저장소 구성
 
