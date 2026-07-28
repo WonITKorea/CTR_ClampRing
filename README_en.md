@@ -96,12 +96,7 @@ Use the `Camera / Ring` panel to select a UVC camera, capture an unloaded
 baseline, and record major/minor diameter, ovality, and baseline deformation.
 The project uses `opencv-python-headless` to avoid Qt plugin conflicts.
 
-## Pre-commit validation
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\verify.ps1
-git status --short
-git diff --check
 ```
 
 Before testing real motion, verify emergency stops, limits, SSCNET wiring,
