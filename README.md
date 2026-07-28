@@ -138,13 +138,7 @@ System Start, Servo 또는 모션 명령은 보내지 않습니다.
 PyQt와 OpenCV Qt 플러그인 충돌을 피하기 위해
 `opencv-python-headless`를 사용합니다.
 
-## 커밋 전 검사
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\verify.ps1
-git status --short
-git diff --check
-```
 
 실제 하드웨어 시험 전에는 비상정지, 리미트, SSCNET 배선, 앰프 전원과 축
 번호를 반드시 확인하십시오.
