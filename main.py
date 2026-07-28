@@ -405,55 +405,51 @@ class ClampTestMachineApp(QMainWindow):
         layout_report.addWidget(QLabel("품번\n(Part Number)"), 4, 0)
         self.in_part_no = QLineEdit("GCR0127")
         layout_report.addWidget(self.in_part_no, 4, 1)
+        layout_report.setColumnStretch(0, 0)
+        layout_report.setColumnStretch(1, 1)
+        layout_report.setColumnMinimumWidth(1, 110)
         group_report.setLayout(layout_report)
+        group_report.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         left_layout.addWidget(group_report, 0, 0)
 
-        group_jig = QGroupBox("Jig / Camera")
-        layout_jig = QVBoxLayout()
-        self.jig_combo = QComboBox()
-        self.jig_combo.addItems(["10.6 mm", "22.6 mm", "32.6 mm"])
-        self.jig_combo.currentTextChanged.connect(self.update_camera_focus)
-        self.lbl_camera = QLabel("Camera Focus Action: Adjusted to 10.6 mm")
-        layout_jig.addWidget(QLabel("Select Jig Size:"))
-        layout_jig.addWidget(self.jig_combo)
-        layout_jig.addWidget(self.lbl_camera)
-        group_jig.setLayout(layout_jig)
-        left_layout.addWidget(group_jig, 0, 1)
-
-        group_params = QGroupBox("Test")
+        group_params = QGroupBox("테스트 설정")
         layout_params = QGridLayout()
-        layout_params.addWidget(QLabel("Min Length (mm):"), 0, 0)
+        layout_params.addWidget(QLabel("최소 길이 (mm):"), 0, 0)
         self.in_min_len = QLineEdit("0.0")
         layout_params.addWidget(self.in_min_len, 0, 1)
-        layout_params.addWidget(QLabel("Max Length (mm):"), 1, 0)
+        layout_params.addWidget(QLabel("최대 길이 (mm):"), 1, 0)
         self.in_max_len = QLineEdit("50.0")
         layout_params.addWidget(self.in_max_len, 1, 1)
-        layout_params.addWidget(QLabel("Speed (mm/min):"), 2, 0)
+        layout_params.addWidget(QLabel("속력 (mm/min):"), 2, 0)
         self.in_speed = QLineEdit("10")
         self.in_speed.setToolTip(
             "실장비 자동 시험에서는 MR-MC240N 이동 속도(mm/min)로 사용됩니다."
         )
         layout_params.addWidget(self.in_speed, 2, 1)
-        layout_params.addWidget(QLabel("Hold Time (sec):"), 3, 0)
+        layout_params.addWidget(QLabel("목표 하중 시간 (초):"), 3, 0)
         self.in_hold = QLineEdit("5.0")
         layout_params.addWidget(self.in_hold, 3, 1)
-        layout_params.addWidget(QLabel("Target Load:"), 4, 0)
+        layout_params.addWidget(QLabel("목표 하중:"), 4, 0)
         self.in_load = QLineEdit("10.0")
         layout_params.addWidget(self.in_load, 4, 1)
-        layout_params.addWidget(QLabel("Operation Strokes:"), 5, 0)
+        layout_params.addWidget(QLabel("스트로크 횟수:"), 5, 0)
         self.in_strokes = QLineEdit("3")
         self.in_strokes.setToolTip(
             "MR-MC240N 사용 시 1 Stroke는 Min → Max → Hold → Min 왕복 1회입니다."
         )
         layout_params.addWidget(self.in_strokes, 5, 1)
+        layout_params.setColumnStretch(0, 0)
+        layout_params.setColumnStretch(1, 1)
+        layout_params.setColumnMinimumWidth(1, 110)
         self.lbl_status = QLabel("Status: NOT READY (Hardware not checked)")
         self.lbl_status.setWordWrap(True)
         self.lbl_status.setStyleSheet("color: #C62828; font-weight: bold;")
         layout_params.addWidget(self.lbl_status, 6, 0, 1, 2)
         group_params.setLayout(layout_params)
-        left_layout.addWidget(group_params, 1, 0)
+        group_params.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        left_layout.addWidget(group_params, 0, 1)
 
-        group_settings = QGroupBox("Settings")
+        group_settings = QGroupBox("그래프 세팅")
         layout_settings = QVBoxLayout()
         self.unit_combo = QComboBox()
         self.unit_combo.addItems(["kgf", "N"])
@@ -468,11 +464,12 @@ class ClampTestMachineApp(QMainWindow):
         layout_settings.addWidget(QLabel("Graph Interpolation:"))
         layout_settings.addWidget(self.interp_combo)
 
-        self.btn_zero = QPushButton("Zero Sensors & Reset Data")
+        self.btn_zero = QPushButton("영점조절 & Data 리셋")
         self.btn_zero.clicked.connect(self.zero_sensors)
         layout_settings.addWidget(self.btn_zero)
         group_settings.setLayout(layout_settings)
-        left_layout.addWidget(group_settings, 1, 1)
+        group_settings.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        left_layout.addWidget(group_settings, 1, 0)
 
         group_fc400 = QGroupBox("FC400 / USB-6002")
         group_fc400.setMaximumHeight(220)
@@ -481,40 +478,40 @@ class ClampTestMachineApp(QMainWindow):
 
         layout_fc400.setColumnStretch(3, 1)
 
-        layout_fc400.addWidget(QLabel("Physical Channel:"), 0, 0)
+        layout_fc400.addWidget(QLabel("기기 채널:"), 0, 0)
         self.in_fc400_daq_channel = QLineEdit("Dev1/ai0")
         self.in_fc400_daq_channel.editingFinished.connect(self.refresh_ni_devices)
         layout_fc400.addWidget(self.in_fc400_daq_channel, 0, 1)
 
-        layout_fc400.addWidget(QLabel("Terminal Mode:"), 0, 2)
+        layout_fc400.addWidget(QLabel("모드:"), 0, 2)
         self.fc400_terminal_combo = QComboBox()
         self.fc400_terminal_combo.addItems(["Differential", "RSE"])
         layout_fc400.addWidget(self.fc400_terminal_combo, 0, 3)
 
-        layout_fc400.addWidget(QLabel("Zero Output [V]:"), 1, 0)
+        layout_fc400.addWidget(QLabel("무부하 전압 [V]:"), 1, 0)
         self.in_fc400_zero_voltage = QLineEdit("0.0")
         layout_fc400.addWidget(self.in_fc400_zero_voltage, 1, 1)
 
-        layout_fc400.addWidget(QLabel("Full-scale Output [V]:"), 1, 2)
+        layout_fc400.addWidget(QLabel("최대 출력 전압 [V]:"), 1, 2)
         self.in_fc400_full_scale_voltage = QLineEdit("10.0")
         layout_fc400.addWidget(self.in_fc400_full_scale_voltage, 1, 3)
 
-        layout_fc400.addWidget(QLabel("FC400 Full Scale:"), 2, 0)
+        layout_fc400.addWidget(QLabel("FC400 최대값:"), 2, 0)
         self.in_fc400_full_scale_load = QLineEdit("1000.0")
         layout_fc400.addWidget(self.in_fc400_full_scale_load, 2, 1)
 
-        layout_fc400.addWidget(QLabel("FC400 Unit:"), 2, 2)
+        layout_fc400.addWidget(QLabel("FC400 단위:"), 2, 2)
         self.fc400_device_unit_combo = QComboBox()
         self.fc400_device_unit_combo.addItems(["N", "kgf"])
         self.fc400_device_unit_combo.setCurrentText("N")
         self.fc400_device_unit_combo.currentTextChanged.connect(self.on_source_configuration_changed)
         layout_fc400.addWidget(self.fc400_device_unit_combo, 2, 3)
 
-        layout_fc400.addWidget(QLabel("Sample Rate [S/s]:"), 3, 0)
+        layout_fc400.addWidget(QLabel("샘플 속도 [S/s]:"), 3, 0)
         self.in_fc400_sample_rate = QLineEdit("1000")
         layout_fc400.addWidget(self.in_fc400_sample_rate, 3, 1)
 
-        self.btn_refresh_fc400_daq = QPushButton("Refresh NI Devices")
+        self.btn_refresh_fc400_daq = QPushButton("NI 기기 새로고침")
         self.btn_refresh_fc400_daq.clicked.connect(self.refresh_ni_devices)
         layout_fc400.addWidget(self.btn_refresh_fc400_daq, 3, 2, 1, 2)
 
@@ -526,6 +523,7 @@ class ClampTestMachineApp(QMainWindow):
         self._fc400_status_text = init_fc400_status
 
         group_fc400.setLayout(layout_fc400)
+        group_fc400.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         left_layout.addWidget(group_fc400, 2, 0, 1, 2)
 
         group_position = QGroupBox("MR-MC240N 6-Axis")
@@ -539,7 +537,7 @@ class ClampTestMachineApp(QMainWindow):
             self.chk_position_monitor.setEnabled(False)
         layout_position.addWidget(self.chk_position_monitor)
 
-        connection_group = QGroupBox("Controller connection")
+        connection_group = QGroupBox("포지션보드 연결 설정")
         connection_grid = QGridLayout(connection_group)
         connection_grid.setContentsMargins(10, 12, 10, 10)
         connection_grid.setHorizontalSpacing(10)
@@ -558,15 +556,15 @@ class ClampTestMachineApp(QMainWindow):
         )
         connection_grid.addWidget(self.mr_connection_combo, 0, 1)
 
-        connection_grid.addWidget(QLabel("DLL Path (optional):"), 0, 2)
+        connection_grid.addWidget(QLabel("DLL 경로 (optional):"), 0, 2)
         self.in_mr_dll_path = QLineEdit("")
         connection_grid.addWidget(self.in_mr_dll_path, 0, 3)
 
-        connection_grid.addWidget(QLabel("Board ID:"), 1, 0)
+        connection_grid.addWidget(QLabel("보드 ID:"), 1, 0)
         self.in_mr_board_id = QLineEdit("0")
         connection_grid.addWidget(self.in_mr_board_id, 1, 1)
 
-        connection_grid.addWidget(QLabel("Axis No:"), 1, 2)
+        connection_grid.addWidget(QLabel("축 No:"), 1, 2)
         self.in_mr_axis_no = QComboBox()
         self.in_mr_axis_no.addItems([str(axis) for axis in range(1, 7)])
         self.in_mr_axis_no.setToolTip(
@@ -612,47 +610,47 @@ class ClampTestMachineApp(QMainWindow):
         connection_grid.addWidget(self.btn_mr_apply_six_axis, 4, 0, 1, 4)
         layout_position.addWidget(connection_group)
 
-        motion_group = QGroupBox("Axis setup and operation")
+        motion_group = QGroupBox("축 설정 및 모션 제어")
         motion_grid = QGridLayout(motion_group)
         motion_grid.setContentsMargins(10, 12, 10, 10)
         motion_grid.setHorizontalSpacing(10)
         motion_grid.setVerticalSpacing(9)
+        motion_grid.setColumnStretch(0, 1)
         motion_grid.setColumnStretch(1, 1)
-        motion_grid.setColumnStretch(3, 1)
 
-        motion_grid.addWidget(QLabel("Speed [mm/min]:"), 0, 0)
+        motion_grid.addWidget(QLabel("속력 [mm/min]:"), 0, 0)
         self.in_mr_motion_speed = QLineEdit("100")
-        motion_grid.addWidget(self.in_mr_motion_speed, 0, 1)
+        motion_grid.addWidget(self.in_mr_motion_speed, 1, 0)
 
-        motion_grid.addWidget(QLabel("Accel / Decel [ms]:"), 0, 2)
+        motion_grid.addWidget(QLabel("가속 /감속 [ms]:"), 0, 1)
         motion_time_layout = QHBoxLayout()
         self.in_mr_acceleration_ms = QLineEdit("500")
         self.in_mr_deceleration_ms = QLineEdit("500")
         motion_time_layout.addWidget(self.in_mr_acceleration_ms)
         motion_time_layout.addWidget(self.in_mr_deceleration_ms)
-        motion_grid.addLayout(motion_time_layout, 0, 3)
+        motion_grid.addLayout(motion_time_layout, 1, 1)
 
-        motion_grid.addWidget(QLabel("Relative Move [mm]:"), 1, 0)
+        motion_grid.addWidget(QLabel("상대 이동량 [mm]:"), 2, 0)
         self.in_mr_relative_move_mm = QLineEdit("1.0")
-        motion_grid.addWidget(self.in_mr_relative_move_mm, 1, 1)
+        motion_grid.addWidget(self.in_mr_relative_move_mm, 3, 0)
 
         servo_layout = QHBoxLayout()
-        self.btn_mr_servo_on = QPushButton("Servo ON")
+        self.btn_mr_servo_on = QPushButton("서보 ON")
         self.btn_mr_servo_on.clicked.connect(lambda: self.set_position_servo(True))
-        self.btn_mr_servo_off = QPushButton("Servo OFF")
+        self.btn_mr_servo_off = QPushButton("서보 OFF")
         self.btn_mr_servo_off.clicked.connect(lambda: self.set_position_servo(False))
         servo_layout.addWidget(self.btn_mr_servo_on)
         servo_layout.addWidget(self.btn_mr_servo_off)
-        motion_grid.addLayout(servo_layout, 1, 2, 1, 2)
+        motion_grid.addLayout(servo_layout, 3, 1)
 
         motion_layout = QHBoxLayout()
-        self.btn_mr_home = QPushButton("Home")
+        self.btn_mr_home = QPushButton("홈")
         self.btn_mr_home.clicked.connect(self.start_position_home)
-        self.btn_mr_move_relative = QPushButton("Move Relative")
+        self.btn_mr_move_relative = QPushButton("상대 이동")
         self.btn_mr_move_relative.clicked.connect(self.start_position_relative_move)
         motion_layout.addWidget(self.btn_mr_home)
         motion_layout.addWidget(self.btn_mr_move_relative)
-        motion_grid.addLayout(motion_layout, 2, 0, 1, 2)
+        motion_grid.addLayout(motion_layout, 4, 0)
 
         jog_layout = QHBoxLayout()
         self.btn_mr_jog_minus = QPushButton("JOG -")
@@ -667,23 +665,23 @@ class ClampTestMachineApp(QMainWindow):
         self.btn_mr_jog_plus.released.connect(self.stop_position_jog)
         jog_layout.addWidget(self.btn_mr_jog_minus)
         jog_layout.addWidget(self.btn_mr_jog_plus)
-        motion_grid.addLayout(jog_layout, 2, 2, 1, 2)
+        motion_grid.addLayout(jog_layout, 4, 1)
 
         stop_layout = QHBoxLayout()
-        self.btn_mr_stop = QPushButton("Stop")
+        self.btn_mr_stop = QPushButton("정지")
         self.btn_mr_stop.clicked.connect(lambda: self.stop_position_motion(False))
-        self.btn_mr_rapid_stop = QPushButton("EMERG STOP")
+        self.btn_mr_rapid_stop = QPushButton("긴급정지")
         self.btn_mr_rapid_stop.clicked.connect(lambda: self.stop_position_motion(True))
         self.btn_mr_rapid_stop.setStyleSheet(
             "background-color: #C62828; color: white; font-weight: bold;"
         )
         stop_layout.addWidget(self.btn_mr_stop)
         stop_layout.addWidget(self.btn_mr_rapid_stop)
-        motion_grid.addLayout(stop_layout, 3, 0, 1, 2)
+        motion_grid.addLayout(stop_layout, 5, 0)
 
         self.btn_mr_refresh_status = QPushButton("Refresh Axis Status")
         self.btn_mr_refresh_status.clicked.connect(self.refresh_position_axis_status)
-        motion_grid.addWidget(self.btn_mr_refresh_status, 3, 2, 1, 2)
+        motion_grid.addWidget(self.btn_mr_refresh_status, 5, 1)
         layout_position.addWidget(motion_group)
 
         overview_group = QGroupBox("Six-axis overview")
@@ -736,18 +734,19 @@ class ClampTestMachineApp(QMainWindow):
         self.append_system_log(mr_status, "MR-MC240N")
 
         group_position.setLayout(layout_position)
-        left_layout.addWidget(group_position, 0, 2, 4, 1)
+        left_layout.addWidget(group_position, 0, 2, 6, 1)
 
         self.btn_start = QPushButton("Start FC400 + MR-MC240N Test")
         self.btn_start.clicked.connect(self.toggle_test)
         self.btn_start.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 10px;")
         left_layout.addWidget(self.btn_start, 3, 0, 1, 2)
-        for widget_type in (QLineEdit, QPushButton, QComboBox, QCheckBox):
+        left_layout.setRowStretch(5, 1)
+        for widget_type in (QLineEdit, QPushButton, QComboBox):
             for widget in left_container.findChildren(widget_type):
                 policy = widget.sizePolicy()
-                policy.setHorizontalPolicy(QSizePolicy.Ignored)
+                policy.setHorizontalPolicy(QSizePolicy.Expanding)
                 widget.setSizePolicy(policy)
-        main_layout.addWidget(left_container, 13)
+        main_layout.addWidget(left_container, 11)
 
         right_container = QWidget()
         right_container.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
@@ -761,26 +760,36 @@ class ClampTestMachineApp(QMainWindow):
         self.chart.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         top_visual_layout.addWidget(self.chart, 2)
 
-        group_camera = QGroupBox("Camera / Ring")
+        group_camera_settings = QGroupBox("Jig / Camera / Ring")
         layout_camera = QGridLayout()
         layout_camera.setColumnStretch(1, 1)
         layout_camera.setColumnStretch(3, 1)
 
-        layout_camera.addWidget(QLabel("Camera Index:"), 0, 0)
-        self.in_camera_index = QLineEdit("0")
-        layout_camera.addWidget(self.in_camera_index, 0, 1)
+        layout_camera.addWidget(QLabel("Jig Size:"), 0, 0)
+        self.jig_combo = QComboBox()
+        self.jig_combo.addItems(["10.6 mm", "22.6 mm", "32.6 mm"])
+        self.jig_combo.currentTextChanged.connect(self.update_camera_focus)
+        layout_camera.addWidget(self.jig_combo, 0, 1)
 
-        layout_camera.addWidget(QLabel("Resolution:"), 0, 2)
+        layout_camera.addWidget(QLabel("Camera Index:"), 0, 2)
+        self.in_camera_index = QLineEdit("0")
+        layout_camera.addWidget(self.in_camera_index, 0, 3)
+
+        layout_camera.addWidget(QLabel("Known Ring OD [mm]:"), 1, 0)
+        self.in_camera_reference_diameter = QLineEdit(
+            self.jig_combo.currentText().split()[0]
+        )
+        self.in_camera_reference_diameter.setModified(False)
+        self.in_camera_reference_diameter.setToolTip(
+            "실제 링 외경(mm)을 입력하면 pixel 값을 mm로 환산합니다."
+        )
+        layout_camera.addWidget(self.in_camera_reference_diameter, 1, 1)
+
+        layout_camera.addWidget(QLabel("Resolution:"), 1, 2)
         self.camera_resolution_combo = QComboBox()
         self.camera_resolution_combo.addItems(["640x480", "1280x720", "1920x1080"])
         self.camera_resolution_combo.setCurrentText("1280x720")
-        layout_camera.addWidget(self.camera_resolution_combo, 0, 3)
-
-        layout_camera.addWidget(QLabel("Known Ring OD [mm]:"), 1, 0)
-        self.in_camera_reference_diameter = QLineEdit(self.jig_combo.currentText().split()[0])
-        self.in_camera_reference_diameter.setModified(False)
-        self.in_camera_reference_diameter.setToolTip("실제 링 외경(mm)을 입력하면 pixel 값을 mm로 환산합니다.")
-        layout_camera.addWidget(self.in_camera_reference_diameter, 1, 1)
+        layout_camera.addWidget(self.camera_resolution_combo, 1, 3)
 
         layout_camera.addWidget(QLabel("Clamp Ring Color:"), 2, 0)
         self.camera_ring_color_combo = QComboBox()
@@ -797,14 +806,18 @@ class ClampTestMachineApp(QMainWindow):
         self.btn_camera_baseline = QPushButton("Capture Baseline")
         self.btn_camera_baseline.clicked.connect(self.capture_ring_baseline)
         self.btn_camera_baseline.setEnabled(False)
-        layout_camera.addWidget(self.btn_camera_baseline, 1, 3)
+        layout_camera.addWidget(self.btn_camera_baseline, 2, 2, 1, 2)
 
         self.btn_camera_clear_baseline = QPushButton("Clear Baseline")
         self.btn_camera_clear_baseline.clicked.connect(self.clear_ring_baseline)
         self.btn_camera_clear_baseline.setEnabled(False)
-        layout_camera.addWidget(self.btn_camera_clear_baseline, 2, 2, 1, 2)
+        layout_camera.addWidget(self.btn_camera_clear_baseline, 3, 2, 1, 2)
 
-        layout_camera.addWidget(self.btn_camera_toggle, 3, 0, 1, 4)
+        self.lbl_camera = QLabel("Camera Focus Action: Adjusted to 10.6 mm")
+        self.lbl_camera.setWordWrap(True)
+        layout_camera.addWidget(self.lbl_camera, 3, 0, 1, 2)
+
+        layout_camera.addWidget(self.btn_camera_toggle, 4, 0, 1, 4)
 
         init_camera_status = "Camera: connect a UVC camera and click Open Camera"
         if not CV2_AVAILABLE:
@@ -813,6 +826,20 @@ class ClampTestMachineApp(QMainWindow):
         self._camera_status_text = init_camera_status
         self.append_system_log(init_camera_status, "CAMERA")
 
+        group_camera_settings.setLayout(layout_camera)
+        group_camera_settings.setSizePolicy(
+            QSizePolicy.Preferred, QSizePolicy.Maximum
+        )
+        for widget_type in (QLineEdit, QPushButton, QComboBox):
+            for widget in group_camera_settings.findChildren(widget_type):
+                policy = widget.sizePolicy()
+                policy.setHorizontalPolicy(QSizePolicy.Expanding)
+                widget.setSizePolicy(policy)
+        left_layout.addWidget(group_camera_settings, 4, 0, 1, 2)
+
+        group_camera_viewfinder = QGroupBox("Camera Viewfinder")
+        layout_camera_viewfinder = QVBoxLayout(group_camera_viewfinder)
+
         self.lbl_camera_preview = QLabel("Camera preview is not running.")
         self.lbl_camera_preview.setAlignment(Qt.AlignCenter)
         self.lbl_camera_preview.setMinimumSize(260, 160)
@@ -820,7 +847,7 @@ class ClampTestMachineApp(QMainWindow):
         self.lbl_camera_preview.setStyleSheet(
             "background-color: #111111; color: #DDDDDD; border: 1px solid #444444; padding: 8px;"
         )
-        layout_camera.addWidget(self.lbl_camera_preview, 4, 0, 1, 4)
+        layout_camera_viewfinder.addWidget(self.lbl_camera_preview, 1)
 
         self.lbl_ring_metrics = QLabel("")
         self.lbl_ring_metrics.setWordWrap(True)
@@ -828,15 +855,9 @@ class ClampTestMachineApp(QMainWindow):
         self.lbl_ring_metrics.setStyleSheet(
             "background-color: #F8F8F8; border: 1px solid #D0D0D0; padding: 8px; font-family: monospace;"
         )
-        layout_camera.addWidget(self.lbl_ring_metrics, 5, 0, 1, 4)
+        layout_camera_viewfinder.addWidget(self.lbl_ring_metrics)
 
-        group_camera.setLayout(layout_camera)
-        for widget_type in (QLineEdit, QPushButton, QComboBox):
-            for widget in group_camera.findChildren(widget_type):
-                policy = widget.sizePolicy()
-                policy.setHorizontalPolicy(QSizePolicy.Ignored)
-                widget.setSizePolicy(policy)
-        top_visual_layout.addWidget(group_camera, 3)
+        top_visual_layout.addWidget(group_camera_viewfinder, 3)
         right_panel.addLayout(top_visual_layout, 3)
 
         self.table = QTableWidget(6, 4)
@@ -857,7 +878,7 @@ class ClampTestMachineApp(QMainWindow):
         btn_layout.addWidget(self.btn_pdf)
         right_panel.addLayout(btn_layout)
 
-        main_layout.addWidget(right_container, 7)
+        main_layout.addWidget(right_container, 9)
         self.timer = QTimer()
         self.timer.timeout.connect(self.timer_step)
 
