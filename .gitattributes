@@ -1,0 +1,14 @@
+* text=auto
+
+*.py text eol=lf
+*.c text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.ps1 text eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.dll binary
+*.exe binary
+*.lib binary

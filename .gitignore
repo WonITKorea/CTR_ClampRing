@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.venv/
+venv/
+
+# Test, lint, and packaging caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Generated reports and diagnostics
+*.csv
+*.pdf
+*.log
+*.jsonl
+reports/
+exports/
+artifacts/
+
+# Generated native bridge
+bin/*
+!bin/.gitkeep
+
+# Mitsubishi vendor files are installed locally and are not redistributed.
+vendor/mitsubishi/*
+!vendor/mitsubishi/README.md
+mc2xxstd*.dll
+mc2xxstd*.lib
+
+# Local vendor packages and reverse-engineering workbench
+PbTest/
+Header File/
+Library/
+.reverse_tools/
+tools/
+.codex
