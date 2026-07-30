@@ -33,6 +33,8 @@ from hardware import (
 
 APP_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
 CTR_LOGO_PATH = os.path.join(APP_DIRECTORY, "Logo_CTR.png")
+CTR_LOGO_MAX_WIDTH = 150
+CTR_LOGO_HEADER_HEIGHT = 44
 
 AXIS_TRAVEL_MIN_MM = 0.0
 AXIS_TRAVEL_MAX_MM = 196.0
@@ -508,13 +510,13 @@ class ClampTestMachineApp(QMainWindow):
         report_panel_layout.setSpacing(6)
 
         report_header = QWidget()
-        report_header.setFixedHeight(28)
+        report_header.setFixedHeight(CTR_LOGO_HEADER_HEIGHT)
         report_header_layout = QHBoxLayout(report_header)
         report_header_layout.setContentsMargins(0, 0, 0, 0)
         report_header_layout.setSpacing(8)
 
         self.lbl_ctr_logo = AspectRatioLogoLabel(CTR_LOGO_PATH)
-        self.lbl_ctr_logo.setMaximumWidth(100)
+        self.lbl_ctr_logo.setMaximumWidth(CTR_LOGO_MAX_WIDTH)
         if self.lbl_ctr_logo.hasHeightForWidth():
             report_header_layout.addWidget(self.lbl_ctr_logo)
         else:
@@ -5477,7 +5479,7 @@ class ClampTestMachineApp(QMainWindow):
 
         if os.path.isfile(CTR_LOGO_PATH):
             try:
-                ax_logo = fig.add_axes([0.08, 0.915, 0.18, 0.05])
+                ax_logo = fig.add_axes([0.06, 0.91, 0.22, 0.06])
                 ax_logo.imshow(plt.imread(CTR_LOGO_PATH))
                 ax_logo.axis('off')
             except (OSError, ValueError):

@@ -15,6 +15,8 @@ from PyQt5.QtWidgets import QApplication, QGroupBox, QLabel, QSizePolicy
 
 from main import (
     AXIS_TRAVEL_MAX_MM,
+    CTR_LOGO_HEADER_HEIGHT,
+    CTR_LOGO_MAX_WIDTH,
     MOTION_RAMP_MAX_MS,
     USB_MOTION_SPEED_MAX_MM_MIN,
     ClampTestMachineApp,
@@ -144,6 +146,15 @@ class DocumentFeedbackTests(unittest.TestCase):
             position_layout.stretch(position_layout.indexOf(system_log_group)),
             1,
         )
+
+    def test_ctr_logo_uses_enlarged_header_space(self):
+        logo = self.window.lbl_ctr_logo
+        self.assertEqual(logo.maximumWidth(), CTR_LOGO_MAX_WIDTH)
+        self.assertEqual(
+            logo.parentWidget().height(),
+            CTR_LOGO_HEADER_HEIGHT,
+        )
+        self.assertGreaterEqual(logo.maximumWidth(), 150)
 
     def test_right_column_orders_camera_graph_and_table(self):
         main_layout = self.window.centralWidget().layout()
