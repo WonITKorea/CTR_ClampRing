@@ -12,6 +12,10 @@ Windows/PyQt application for a six-axis clamp test machine.
 The app opens as a maximized window with the title bar and taskbar visible.
 F11 toggles full-screen mode.
 
+Graph, FC400, camera-detection, and MR connection parameters are grouped in
+the tabbed `Equipment / Graph Settings` dialog. Tare, motion arm/stop, camera
+open/record, and test controls remain on the main screen.
+
 ## Quick start
 
 Python 3.10 or newer is recommended.
@@ -82,6 +86,12 @@ The current six-axis preset assumes:
 - THK BTK1404, 4 mm lead, direct 1:1 coupling
 - `1000 command units/mm`
 
+The current software limits assume the BTK1404-3.6ZZ+196LC7 arrangement:
+position `0–196 mm`, USB speed `1–12,000 mm/min`, and acceleration/deceleration
+`0–20,000 ms`. Relative moves and JOG are checked against the same position
+limits. Verify these values against the assembled machine's measured usable
+stroke and hardware limits before motion.
+
 ## PCIe diagnostic
 
 ```powershell
@@ -136,8 +146,26 @@ Use the `Camera / Ring` panel to select a UVC camera, capture an unloaded
 baseline, and record major/minor diameter, ovality, and baseline deformation.
 The project uses `opencv-python-headless` to avoid Qt plugin conflicts.
 
+The Viewfinder recording button writes an overlayed MJPG AVI. Optional automatic
+recording starts and stops with a test and saves under
+`Videos/CTR_ClampRing_Recordings`.
 
-```
+## Load safety and result review
+
+The safety load limit must be greater than the target load and no greater than
+the configured FC400 capacity. Every USB-6002 sample drained from the DAQ buffer
+is checked, so an intermediate overload is not hidden by a lower final sample.
+A trip attempts Rapid Stop on axes 1–6 before motion-state processing, stops the
+test, and records the event.
+
+This Windows application interlock supplements, but does not replace, a
+hardwired emergency stop, amplifier/STO protection, and mechanical limit
+switches.
+
+After a test, the chart slider reviews recorded load distributions in time or
+position order. Completed samples accumulate in the sample-results list.
+Selected samples—or all samples when no row is selected—are exported as one
+PDF page per sample in a single PDF.
 
 Before testing real motion, verify emergency stops, limits, SSCNET wiring,
 amplifier power, and axis-number switches.

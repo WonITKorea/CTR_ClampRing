@@ -463,6 +463,36 @@ class MrMc240nUsbController:
         self._jog_active = False
         self._clear_motion_latch()
 
+    def stop_all_axes(
+        self,
+        axis_numbers=range(1, 7),
+        rapid=True,
+        timeout_ms=3000,
+    ):
+        """Stop every requested axis, aggregating per-axis dispatch failures."""
+        command = "RAPID_STOP" if rapid else "STOP"
+        failures = []
+        try:
+            for requested_axis in axis_numbers:
+                try:
+                    axis = int(requested_axis)
+                    self._request(f"{command} {axis}")
+                except Exception as exc:
+                    failures.append((requested_axis, exc))
+        finally:
+            # Do not clear local state until every requested stop was attempted.
+            self._jog_active = False
+            self._clear_motion_latch()
+
+        if failures:
+            details = "; ".join(
+                f"axis {axis}: {error}" for axis, error in failures
+            )
+            raise RuntimeError(
+                f"MR-MC240N USB {command.lower().replace('_', ' ')} failed "
+                f"for {len(failures)} axis/axes: {details}"
+            )
+
 
 class MrMc240nPositionController:
     """ctypes wrapper for MR-MC200 monitoring and standard-mode axis control."""
@@ -1061,6 +1091,48 @@ class MrMc240nPositionController:
         )
         self._jog_active = False
         self._clear_motion_latch()
+
+    def stop_all_axes(
+        self,
+        axis_numbers=range(1, 7),
+        rapid=True,
+        timeout_ms=3000,
+    ):
+        """Stop every requested axis, aggregating per-axis dispatch failures."""
+        timeout_ms = int(timeout_ms)
+        if not 0 <= timeout_ms <= 65_535:
+            raise ValueError("Stop timeout must be between 0 and 65535 ms.")
+
+        api_name = "sscDriveRapidStop" if rapid else "sscDriveStop"
+        failures = []
+        try:
+            for requested_axis in axis_numbers:
+                try:
+                    axis = int(requested_axis)
+                    self._call_api(
+                        api_name,
+                        self.board_id,
+                        self.channel,
+                        axis,
+                        timeout_ms,
+                        allow_cleanup_pending=True,
+                    )
+                except Exception as exc:
+                    failures.append((requested_axis, exc))
+        finally:
+            # Do not clear local state until every requested stop was attempted.
+            self._jog_active = False
+            self._clear_motion_latch()
+
+        if failures:
+            details = "; ".join(
+                f"axis {axis}: {error}" for axis, error in failures
+            )
+            stop_kind = "rapid stop" if rapid else "stop"
+            raise RuntimeError(
+                f"MR-MC240N PCIe {stop_kind} failed for "
+                f"{len(failures)} axis/axes: {details}"
+            )
 
 
 # Backward-compatible name for integrations that imported the original monitor.

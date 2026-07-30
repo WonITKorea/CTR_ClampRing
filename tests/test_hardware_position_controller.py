@@ -11,7 +11,11 @@ from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import hardware
-from hardware import MrMc240nPositionController, describe_mr_mc240n_api_error
+from hardware import (
+    MrMc240nPositionController,
+    MrMc240nUsbController,
+    describe_mr_mc240n_api_error,
+)
 
 
 def fake_vendor_library():
@@ -219,6 +223,62 @@ class PositionControllerApiSignatureTests(unittest.TestCase):
 
         self.assertTrue(controller._motion_command_may_be_active)
         controller.stop(rapid=True)
+        self.assertFalse(controller._motion_command_may_be_active)
+
+    def test_stop_all_axes_uses_vendor_abi_and_attempts_every_axis(self):
+        controller = MrMc240nPositionController(board_id=2, axis_number=6)
+        library = fake_vendor_library()
+
+        def stop_axis(_board_id, _channel, axis_number, _timeout_ms):
+            return -1 if axis_number in (2, 5) else 0
+
+        library.sscDriveRapidStop.side_effect = stop_axis
+        library.sscGetLastError.return_value = 0x00010000
+        controller.library = library
+        controller._is_open = True
+        controller._jog_active = True
+        controller._motion_command_may_be_active = True
+
+        with self.assertRaises(RuntimeError) as raised:
+            controller.stop_all_axes()
+
+        self.assertEqual(
+            library.sscDriveRapidStop.call_args_list,
+            [call(2, 1, axis, 3000) for axis in range(1, 7)],
+        )
+        self.assertIn("axis 2", str(raised.exception))
+        self.assertIn("axis 5", str(raised.exception))
+        self.assertFalse(controller._jog_active)
+        self.assertFalse(controller._motion_command_may_be_active)
+
+
+class UsbControllerStopTests(unittest.TestCase):
+    def test_stop_all_axes_attempts_every_axis_before_clearing_latches(self):
+        controller = MrMc240nUsbController(board_id=0, axis_number=1)
+        dispatched = []
+
+        def dispatch(command):
+            self.assertTrue(controller._jog_active)
+            self.assertTrue(controller._motion_command_may_be_active)
+            dispatched.append(command)
+            if command in ("RAPID_STOP 2", "RAPID_STOP 5"):
+                raise RuntimeError(f"simulated failure for {command}")
+            return {"ok": True}
+
+        controller._request = Mock(side_effect=dispatch)
+        controller._jog_active = True
+        controller._motion_command_may_be_active = True
+
+        with self.assertRaises(RuntimeError) as raised:
+            controller.stop_all_axes()
+
+        self.assertEqual(
+            dispatched,
+            [f"RAPID_STOP {axis}" for axis in range(1, 7)],
+        )
+        self.assertIn("axis 2", str(raised.exception))
+        self.assertIn("axis 5", str(raised.exception))
+        self.assertFalse(controller._jog_active)
         self.assertFalse(controller._motion_command_may_be_active)
 
 
