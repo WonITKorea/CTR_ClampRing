@@ -288,6 +288,8 @@ class ClampTestMachineApp(QMainWindow):
         self.ni_daq_task = None
         self.position_monitor = None
         self.position_jog_command_active = False
+        self.position_motion_may_be_active = False
+        self.position_controller_close_failed = False
         self.latest_live_position_mm = None
         self.latest_live_position_counts = None
         self.position_zero_offset_mm = 0.0
@@ -313,6 +315,13 @@ class ClampTestMachineApp(QMainWindow):
         self.camera_timer = QTimer(self)
         self.camera_timer.timeout.connect(self.camera_timer_step)
         self.camera_timer.setTimerType(Qt.PreciseTimer)
+        self.position_motion_status_timer = QTimer(self)
+        self.position_motion_status_timer.setInterval(250)
+        self.position_motion_status_timer.timeout.connect(
+            self.poll_position_motion_status
+        )
+        self.position_motion_status_deadline = 0.0
+        self.position_motion_status_failures = 0
         self.camera_timer_interval_ms = 16
         self.camera_analysis_interval_ms = 50
         self.camera_metrics_update_interval_ms = 120
@@ -558,10 +567,16 @@ class ClampTestMachineApp(QMainWindow):
 
         connection_grid.addWidget(QLabel("DLL 경로 (optional):"), 0, 2)
         self.in_mr_dll_path = QLineEdit("")
+        self.in_mr_dll_path.editingFinished.connect(
+            self.on_position_connection_settings_changed
+        )
         connection_grid.addWidget(self.in_mr_dll_path, 0, 3)
 
         connection_grid.addWidget(QLabel("보드 ID:"), 1, 0)
         self.in_mr_board_id = QLineEdit("0")
+        self.in_mr_board_id.editingFinished.connect(
+            self.on_position_connection_settings_changed
+        )
         connection_grid.addWidget(self.in_mr_board_id, 1, 1)
 
         connection_grid.addWidget(QLabel("축 No:"), 1, 2)
@@ -584,8 +599,17 @@ class ClampTestMachineApp(QMainWindow):
         )
         connection_grid.addWidget(self.in_mr_counts_per_mm, 2, 1)
 
-        self.chk_mr_auto_start = QCheckBox("PCIe only: try sscSystemStart()")
+        self.chk_mr_auto_start = QCheckBox(
+            "PCIe: start system if preparation is complete"
+        )
+        self.chk_mr_auto_start.setToolTip(
+            "Already-running systems are left unchanged. Mitsubishi's "
+            "sscSystemStart may wait at least 10 seconds while initializing SSCNET."
+        )
         self.chk_mr_auto_start.setEnabled(False)
+        self.chk_mr_auto_start.toggled.connect(
+            self.on_position_connection_settings_changed
+        )
         connection_grid.addWidget(self.chk_mr_auto_start, 2, 2)
 
         self.chk_mr_motion_arm = QCheckBox("Arm motion commands")
@@ -1960,7 +1984,11 @@ class ClampTestMachineApp(QMainWindow):
         return self.is_position_monitor_enabled()
 
     def is_position_control_armed(self):
-        return self.is_position_pcie_enabled() and self.chk_mr_motion_arm.isChecked()
+        return (
+            self.is_position_pcie_enabled()
+            and self.chk_mr_motion_arm.isChecked()
+            and not self.position_controller_close_failed
+        )
 
     def get_source_data_unit(self):
         return self.fc400_device_unit_combo.currentText()
@@ -2048,6 +2076,9 @@ class ClampTestMachineApp(QMainWindow):
         ]
         for widget in configuration_widgets:
             widget.setEnabled(enabled)
+        self.chk_mr_auto_start.setEnabled(
+            enabled and not self.is_position_usb_mode()
+        )
 
         if enabled:
             if os.name != "nt":
@@ -2073,7 +2104,18 @@ class ClampTestMachineApp(QMainWindow):
         else:
             if self.chk_mr_motion_arm.isChecked():
                 self.chk_mr_motion_arm.setChecked(False)
-            self.close_position_monitor()
+            if not self.close_position_monitor():
+                self.chk_position_monitor.blockSignals(True)
+                self.chk_position_monitor.setChecked(True)
+                self.chk_position_monitor.blockSignals(False)
+                for widget in configuration_widgets:
+                    widget.setEnabled(True)
+                self.chk_mr_auto_start.setEnabled(
+                    not self.is_position_usb_mode()
+                )
+                self.update_position_control_state()
+                self.update_hardware_readiness_status()
+                return
             if os.name != "nt":
                 self.set_mr_status_text(f"MR-MC240N: {MR_MC240N_WINDOWS_ONLY_MESSAGE}")
             else:
@@ -2087,7 +2129,18 @@ class ClampTestMachineApp(QMainWindow):
         return self.mr_connection_combo.currentText() == MR_CONNECTION_USB_MAINTENANCE
 
     def on_position_connection_changed(self, connection):
-        self.close_position_monitor()
+        previous_connection = None
+        if isinstance(self.position_monitor, MrMc240nUsbController):
+            previous_connection = MR_CONNECTION_USB_MAINTENANCE
+        elif isinstance(self.position_monitor, MrMc240nPositionController):
+            previous_connection = MR_CONNECTION_PCIE_API
+        if not self.close_position_monitor():
+            if previous_connection:
+                self.mr_connection_combo.blockSignals(True)
+                self.mr_connection_combo.setCurrentText(previous_connection)
+                self.mr_connection_combo.blockSignals(False)
+            self.update_position_control_state()
+            return
         if connection == MR_CONNECTION_USB_MAINTENANCE:
             if self.chk_mr_motion_arm.isChecked():
                 self.chk_mr_motion_arm.setChecked(False)
@@ -2107,10 +2160,53 @@ class ClampTestMachineApp(QMainWindow):
             return
         if self.chk_mr_motion_arm.isChecked():
             self.chk_mr_motion_arm.setChecked(False)
-        self.close_position_monitor()
+        previous_axis = (
+            self.position_monitor.axis_number
+            if self.position_monitor is not None
+            else None
+        )
+        if not self.close_position_monitor():
+            if previous_axis is not None:
+                self.in_mr_axis_no.blockSignals(True)
+                self.in_mr_axis_no.setCurrentText(str(previous_axis))
+                self.in_mr_axis_no.blockSignals(False)
+            self.update_position_control_state()
+            return
         if self.is_position_monitor_enabled():
             self.set_mr_status_text(
                 f"MR-MC240N: axis {self.in_mr_axis_no.currentText()} selected; reconnect"
+            )
+        self.update_position_control_state()
+        self.update_hardware_readiness_status()
+
+    def on_position_connection_settings_changed(self, *_args):
+        """Invalidate a live controller when its open-time settings change."""
+        if not hasattr(self, "position_monitor") or self.position_monitor is None:
+            return
+        if self.chk_mr_motion_arm.isChecked():
+            self.chk_mr_motion_arm.setChecked(False)
+        if not self.close_position_monitor():
+            monitor = self.position_monitor
+            if monitor is not None:
+                self.in_mr_dll_path.blockSignals(True)
+                self.in_mr_board_id.blockSignals(True)
+                self.chk_mr_auto_start.blockSignals(True)
+                self.in_mr_dll_path.setText(monitor.dll_path)
+                self.in_mr_board_id.setText(str(monitor.board_id))
+                self.chk_mr_auto_start.setChecked(
+                    bool(
+                        isinstance(monitor, MrMc240nPositionController)
+                        and monitor.auto_start_system
+                    )
+                )
+                self.in_mr_dll_path.blockSignals(False)
+                self.in_mr_board_id.blockSignals(False)
+                self.chk_mr_auto_start.blockSignals(False)
+            self.update_position_control_state()
+            return
+        if self.is_position_monitor_enabled():
+            self.set_mr_status_text(
+                "MR-MC240N: connection settings changed; reconnect"
             )
         self.update_position_control_state()
         self.update_hardware_readiness_status()
@@ -2149,12 +2245,14 @@ class ClampTestMachineApp(QMainWindow):
                 return
             self.set_mr_status_text("MR-MC240N: motion commands armed")
         else:
+            stop_confirmed = True
             if self.live_motion_cycle_active:
-                self.stop_position_motion(True)
+                stop_confirmed = self.stop_position_motion(True)
             elif self.position_jog_command_active:
-                self.stop_position_motion(True)
-            self.position_jog_command_active = False
-            if self.is_position_monitor_enabled():
+                stop_confirmed = self.stop_position_motion(True)
+            if stop_confirmed:
+                self.position_jog_command_active = False
+            if self.is_position_monitor_enabled() and stop_confirmed:
                 self.set_mr_status_text("MR-MC240N: motion commands disarmed")
         self.update_position_control_state()
         self.update_hardware_readiness_status()
@@ -2162,13 +2260,68 @@ class ClampTestMachineApp(QMainWindow):
     def update_position_control_state(self):
         enabled = self.is_position_monitor_enabled() and os.name == "nt"
         control_enabled = enabled
-        armed = control_enabled and self.chk_mr_motion_arm.isChecked()
-        self.btn_mr_connect.setEnabled(enabled)
-        self.btn_mr_system_start.setEnabled(enabled and self.is_position_usb_mode())
-        self.btn_mr_apply_six_axis.setEnabled(
-            enabled and self.is_position_usb_mode() and not armed
+        controller_motion_may_be_active = bool(
+            self.position_monitor is not None
+            and self.position_monitor._motion_command_may_be_active
         )
-        self.chk_mr_motion_arm.setEnabled(control_enabled)
+        motion_may_be_active = (
+            self.position_motion_may_be_active
+            or controller_motion_may_be_active
+        )
+        configuration_locked = (
+            self.is_test_running
+            or self.live_motion_cycle_active
+            or motion_may_be_active
+            or self.position_controller_close_failed
+        )
+        armed = (
+            control_enabled
+            and self.chk_mr_motion_arm.isChecked()
+            and not self.position_controller_close_failed
+        )
+        self.chk_position_monitor.setEnabled(
+            os.name == "nt" and not configuration_locked
+        )
+        configuration_widgets = [
+            self.mr_connection_combo,
+            self.in_mr_dll_path,
+            self.in_mr_board_id,
+            self.in_mr_axis_no,
+            self.in_mr_counts_per_mm,
+            self.in_mr_motion_speed,
+            self.in_mr_acceleration_ms,
+            self.in_mr_deceleration_ms,
+            self.in_mr_relative_move_mm,
+        ]
+        for widget in configuration_widgets:
+            widget.setEnabled(enabled and not configuration_locked)
+        motion_locked = (
+            self.is_test_running
+            or self.live_motion_cycle_active
+            or motion_may_be_active
+        )
+        self.btn_mr_connect.setEnabled(
+            enabled and not motion_locked
+        )
+        self.btn_mr_system_start.setEnabled(
+            enabled
+            and self.is_position_usb_mode()
+            and not configuration_locked
+        )
+        self.btn_mr_apply_six_axis.setEnabled(
+            enabled
+            and self.is_position_usb_mode()
+            and not armed
+            and not configuration_locked
+        )
+        self.chk_mr_auto_start.setEnabled(
+            enabled
+            and not self.is_position_usb_mode()
+            and not configuration_locked
+        )
+        self.chk_mr_motion_arm.setEnabled(
+            control_enabled and not self.position_controller_close_failed
+        )
         motion_buttons = [
             self.btn_mr_servo_on,
             self.btn_mr_servo_off,
@@ -2178,14 +2331,28 @@ class ClampTestMachineApp(QMainWindow):
             self.btn_mr_jog_plus,
         ]
         for button in motion_buttons:
-            button.setEnabled(armed)
+            button.setEnabled(
+                armed
+                and not self.is_test_running
+                and not self.live_motion_cycle_active
+                and not motion_may_be_active
+                and not self.position_controller_close_failed
+            )
         self.btn_mr_stop.setEnabled(control_enabled)
         self.btn_mr_rapid_stop.setEnabled(control_enabled)
         self.btn_mr_refresh_status.setEnabled(control_enabled)
 
     def test_position_board_connection(self):
         """Open the configured board now so detection errors are immediately visible."""
-        self.close_position_monitor()
+        if not self.close_position_monitor():
+            QMessageBox.critical(
+                self,
+                "MR-MC240N Close Error",
+                "기존 컨트롤러의 Rapid Stop/Close를 확인하지 못해 새 연결을 "
+                "시작하지 않았습니다. 외부 비상정지 상태를 확인한 뒤 다시 "
+                "Stop/Close를 시도하세요.",
+            )
+            return
         try:
             self.open_position_monitor()
             controller = self.position_monitor
@@ -2211,9 +2378,10 @@ class ClampTestMachineApp(QMainWindow):
                     f"{axis_text}"
                 )
             else:
+                dll_detail = controller.loaded_library_path or "unknown DLL"
                 self.set_mr_status_text(
-                    f"MR-MC240N: PCIe connected to board {controller.board_id}; "
-                    f"axis {controller.axis_number}"
+                    f"MR-MC240N: PCIe board {controller.board_id} opened with "
+                    f"{dll_detail}; checking axis {controller.axis_number}"
                 )
             self.refresh_position_axis_status()
         except Exception as exc:
@@ -2223,13 +2391,24 @@ class ClampTestMachineApp(QMainWindow):
             self.position_readiness_detail = f"connection failed: {message}"
             self.update_hardware_readiness_status()
             self.set_mr_status_text(f"MR-MC240N: connection failed - {message}")
+            if self.is_position_usb_mode():
+                recovery_text = (
+                    "PB Test나 MR Configurator2가 USB를 사용 중이면 종료한 뒤 "
+                    "보드 전원·USB 드라이버를 확인해주세요."
+                )
+            else:
+                recovery_text = (
+                    "터미널에서 `python mr_mc240n_pcie_check.py`를 실행하세요. "
+                    "DLL 하나만 교체하지 말고 Mitsubishi Position Board Utility2의 "
+                    "API와 드라이버를 같은 배포판으로 설치해야 합니다. "
+                    "복구 전에는 USB controller (direct) 모드를 사용할 수 있습니다."
+                )
             QMessageBox.critical(
                 self,
                 "MR-MC240N Connection Error",
                 "보드를 열지 못했습니다.\n\n"
                 f"{message}\n\n"
-                "PB Test나 MR Configurator2가 USB를 사용 중이면 종료한 뒤 다시 시도하고, "
-                "보드 전원·USB 드라이버를 확인해주세요.",
+                f"{recovery_text}",
             )
 
     def start_position_usb_system(self):
@@ -2583,11 +2762,51 @@ class ClampTestMachineApp(QMainWindow):
     def open_position_monitor(self):
         if not self.is_position_monitor_enabled():
             return
-        if self.position_monitor is not None:
-            return
 
         config = self.get_position_monitor_config()
-        if self.is_position_usb_mode():
+        usb_mode = self.is_position_usb_mode()
+        if self.position_monitor is not None:
+            expected_type = (
+                MrMc240nUsbController
+                if usb_mode
+                else MrMc240nPositionController
+            )
+            configured_dll = (
+                os.path.normcase(
+                    os.path.abspath(os.path.expandvars(config["dll_path"]))
+                )
+                if config["dll_path"]
+                else ""
+            )
+            active_dll = (
+                os.path.normcase(
+                    os.path.abspath(
+                        os.path.expandvars(self.position_monitor.dll_path)
+                    )
+                )
+                if self.position_monitor.dll_path
+                else ""
+            )
+            settings_match = (
+                isinstance(self.position_monitor, expected_type)
+                and self.position_monitor.board_id == config["board_id"]
+                and self.position_monitor.axis_number == config["axis_number"]
+                and active_dll == configured_dll
+                and (
+                    usb_mode
+                    or self.position_monitor.auto_start_system
+                    == config["auto_start_system"]
+                )
+            )
+            if settings_match:
+                return
+            if not self.close_position_monitor():
+                raise RuntimeError(
+                    "The existing MR-MC240N controller could not be stopped/"
+                    "closed, so the new connection settings were not applied."
+                )
+
+        if usb_mode:
             monitor = MrMc240nUsbController(
                 board_id=config["board_id"],
                 axis_number=config["axis_number"],
@@ -2602,42 +2821,116 @@ class ClampTestMachineApp(QMainWindow):
             )
         try:
             monitor.open()
-        except Exception:
-            monitor.close()
+        except Exception as open_error:
+            cleanup_error = None
+            try:
+                monitor.close()
+            except Exception as close_error:
+                cleanup_error = close_error
+            if getattr(monitor, "_is_open", False):
+                self.position_monitor = monitor
+                self.position_controller_close_failed = True
+                self.position_axis_status_checked = False
+                self.position_axis_ready = False
+                self.position_readiness_detail = (
+                    "open failed and board-close could not be confirmed"
+                )
+                detail = (
+                    f"; retry close failed: {cleanup_error}"
+                    if cleanup_error is not None
+                    else ""
+                )
+                self.update_position_control_state()
+                self.update_hardware_readiness_status()
+                raise RuntimeError(
+                    f"{open_error}{detail}. The controller reference was retained "
+                    "so Rapid Stop/Close can be retried."
+                ) from open_error
             raise
 
         self.position_monitor = monitor
         self.position_axis_status_checked = False
         self.position_axis_ready = False
         self.position_readiness_detail = "axis status not checked"
+        connection_detail = "USB bridge"
+        if isinstance(monitor, MrMc240nPositionController):
+            connection_detail = monitor.loaded_library_path or "PCIe API"
         self.set_mr_status_text(
-            f"MR-MC240N: board {config['board_id']} axis {config['axis_number']} opened"
+            f"MR-MC240N: board {config['board_id']} axis "
+            f"{config['axis_number']} opened via {connection_detail}"
         )
         self.update_hardware_readiness_status()
 
     def close_position_monitor(self):
         if self.position_monitor is None:
-            return
+            self.stop_position_motion_status_monitor()
+            return True
+        monitor = self.position_monitor
+        motion_may_be_active = (
+            self.position_jog_command_active
+            or monitor._jog_active
+            or monitor._motion_command_may_be_active
+            or self.live_motion_cycle_active
+            or self.position_motion_may_be_active
+        )
+        if motion_may_be_active:
+            try:
+                monitor.stop(rapid=True, timeout_ms=3000)
+                self.position_jog_command_active = False
+                self.position_motion_may_be_active = False
+            except Exception as exc:
+                self.position_axis_status_checked = False
+                self.position_axis_ready = False
+                self.position_readiness_detail = (
+                    "rapid stop failed; controller retained"
+                )
+                self.set_mr_status_text(
+                    "MR-MC240N: Rapid Stop failed; controller kept open - "
+                    f"{exc}"
+                )
+                self.append_system_log(
+                    f"Rapid Stop failed; controller retained: {exc}",
+                    "MR-MC240N",
+                )
+                self.position_controller_close_failed = True
+                self.update_position_control_state()
+                self.update_hardware_readiness_status()
+                return False
         try:
-            if self.position_jog_command_active or self.position_monitor._jog_active:
-                try:
-                    self.position_monitor.stop(rapid=True, timeout_ms=3000)
-                except Exception:
-                    pass
-            self.position_monitor.close()
-        except Exception:
-            pass
-        finally:
-            self.position_jog_command_active = False
-            self.position_monitor = None
+            monitor.close()
+        except Exception as exc:
             self.position_axis_status_checked = False
             self.position_axis_ready = False
             self.position_readiness_detail = (
-                "not connected"
-                if self.is_position_monitor_enabled()
-                else "position board disabled"
+                "board close failed; controller retained"
             )
+            self.set_mr_status_text(
+                f"MR-MC240N: Close failed; controller retained - {exc}"
+            )
+            self.append_system_log(
+                f"Board close failed; controller retained: {exc}",
+                "MR-MC240N",
+            )
+            self.position_controller_close_failed = True
+            self.update_position_control_state()
             self.update_hardware_readiness_status()
+            return False
+
+        self.position_jog_command_active = False
+        self.position_motion_may_be_active = False
+        self.position_controller_close_failed = False
+        self.position_monitor = None
+        self.stop_position_motion_status_monitor()
+        self.position_axis_status_checked = False
+        self.position_axis_ready = False
+        self.position_readiness_detail = (
+            "not connected"
+            if self.is_position_monitor_enabled()
+            else "position board disabled"
+        )
+        self.update_position_control_state()
+        self.update_hardware_readiness_status()
+        return True
 
     def read_position_feedback(self):
         if not self.is_position_pcie_enabled():
@@ -2661,10 +2954,18 @@ class ClampTestMachineApp(QMainWindow):
     def get_position_controller(self, require_armed=True):
         if not self.is_position_monitor_enabled():
             raise RuntimeError("MR-MC240N position board를 먼저 활성화해주세요.")
+        if require_armed and self.position_controller_close_failed:
+            raise RuntimeError(
+                "이전 MR-MC240N Stop/Close가 확인되지 않아 새 모션 명령을 "
+                "차단했습니다. 외부 비상정지를 확인하고 Rapid Stop/Connect로 "
+                "정리 상태를 다시 확인하세요."
+            )
         if require_armed and not self.is_position_control_armed():
             raise RuntimeError("Arm motion commands를 먼저 활성화해주세요.")
-        if self.position_monitor is None:
-            self.open_position_monitor()
+        # Always pass through the configuration fingerprint check. This
+        # prevents a retained old controller from receiving commands after a
+        # Board ID/DLL/axis setting changed.
+        self.open_position_monitor()
         if self.position_monitor is None:
             raise RuntimeError("MR-MC240N position board를 열지 못했습니다.")
         return self.position_monitor
@@ -2673,6 +2974,73 @@ class ClampTestMachineApp(QMainWindow):
         message = f"{action} 실패: {exc}"
         self.set_mr_status_text(f"MR-MC240N: {message}")
         QMessageBox.critical(self, "MR-MC240N Control Error", message)
+
+    def begin_position_motion_status_monitor(self):
+        if (
+            self.position_monitor is None
+            or not self.position_monitor._motion_command_may_be_active
+        ):
+            self.stop_position_motion_status_monitor()
+            return
+        self.position_motion_status_deadline = time.monotonic() + 300.0
+        self.position_motion_status_failures = 0
+        self.position_motion_status_timer.start()
+
+    def stop_position_motion_status_monitor(self):
+        self.position_motion_status_timer.stop()
+        self.position_motion_status_deadline = 0.0
+        self.position_motion_status_failures = 0
+
+    def poll_position_motion_status(self):
+        controller = self.position_monitor
+        if controller is None:
+            self.stop_position_motion_status_monitor()
+            return
+        if not controller._motion_command_may_be_active:
+            self.position_motion_may_be_active = False
+            self.stop_position_motion_status_monitor()
+            self.update_position_control_state()
+            return
+        if time.monotonic() >= self.position_motion_status_deadline:
+            self.stop_position_motion_status_monitor()
+            self.set_mr_status_text(
+                "MR-MC240N: motion status polling timed out; motion remains "
+                "locked until Stop/Rapid Stop is confirmed"
+            )
+            self.update_position_control_state()
+            return
+        try:
+            axis_status = controller.read_axis_status()
+        except Exception as exc:
+            self.position_motion_status_failures += 1
+            if self.position_motion_status_failures >= 3:
+                self.stop_position_motion_status_monitor()
+                self.set_mr_status_text(
+                    "MR-MC240N: motion status read failed three times; motion "
+                    f"remains locked - {exc}"
+                )
+                self.append_system_log(
+                    f"Motion status monitor stopped after read failures: {exc}",
+                    "MR-MC240N",
+                )
+            return
+
+        self.position_motion_status_failures = 0
+        if axis_status["servo_alarm"] or axis_status["operation_alarm"]:
+            self.stop_position_motion_status_monitor()
+            self.set_mr_status_text(
+                "MR-MC240N: axis alarm while monitoring motion; use Rapid Stop "
+                "and inspect axis status"
+            )
+            self.update_position_control_state()
+            return
+        if not controller._motion_command_may_be_active:
+            self.position_motion_may_be_active = False
+            self.stop_position_motion_status_monitor()
+            self.update_position_control_state()
+            self.set_mr_status_text(
+                f"MR-MC240N: axis {controller.axis_number} motion completion confirmed"
+            )
 
     def set_position_servo(self, enabled):
         action = "Servo ON" if enabled else "Servo OFF"
@@ -2689,16 +3057,29 @@ class ClampTestMachineApp(QMainWindow):
             self.handle_position_command_error(action, exc)
 
     def start_position_home(self):
+        controller = None
         try:
             controller = self.get_position_controller(require_armed=True)
             controller.start_home_return()
+            self.position_motion_may_be_active = (
+                controller._motion_command_may_be_active
+            )
+            self.begin_position_motion_status_monitor()
+            self.update_position_control_state()
             self.set_mr_status_text(
                 f"MR-MC240N: home return started on axis {controller.axis_number}"
             )
         except Exception as exc:
+            if controller is not None:
+                self.position_motion_may_be_active = (
+                    controller._motion_command_may_be_active
+                )
+                self.begin_position_motion_status_monitor()
+                self.update_position_control_state()
             self.handle_position_command_error("Home return", exc)
 
     def start_position_relative_move(self):
+        controller = None
         try:
             controller = self.get_position_controller(require_armed=True)
             board_config = self.get_position_monitor_config()
@@ -2716,15 +3097,27 @@ class ClampTestMachineApp(QMainWindow):
                 motion_config["acceleration_ms"],
                 motion_config["deceleration_ms"],
             )
+            self.position_motion_may_be_active = (
+                controller._motion_command_may_be_active
+            )
+            self.begin_position_motion_status_monitor()
+            self.update_position_control_state()
             self.set_mr_status_text(
                 "MR-MC240N: relative move started "
                 f"({motion_config['distance_mm']:.4f} mm / {distance_counts} command units)"
             )
         except Exception as exc:
+            if controller is not None:
+                self.position_motion_may_be_active = (
+                    controller._motion_command_may_be_active
+                )
+                self.begin_position_motion_status_monitor()
+                self.update_position_control_state()
             self.handle_position_command_error("Relative move", exc)
 
     def start_position_jog(self, direction):
         direction_text = "+" if direction == MrMc240nPositionController.SSC_DIR_PLUS else "-"
+        controller = None
         try:
             controller = self.get_position_controller(require_armed=True)
             motion_config = self.get_position_motion_config()
@@ -2735,36 +3128,98 @@ class ClampTestMachineApp(QMainWindow):
                 motion_config["deceleration_ms"],
             )
             self.position_jog_command_active = True
+            self.position_motion_may_be_active = (
+                controller._motion_command_may_be_active
+            )
+            self.update_position_control_state()
             self.set_mr_status_text(f"MR-MC240N: JOG {direction_text} running")
         except Exception as exc:
-            self.position_jog_command_active = False
+            if controller is not None:
+                automatic_stop_error = None
+                if controller._motion_command_may_be_active:
+                    try:
+                        controller.stop_jog()
+                    except Exception as stop_exc:
+                        automatic_stop_error = stop_exc
+                        try:
+                            controller.stop(rapid=True)
+                            automatic_stop_error = None
+                        except Exception as rapid_stop_exc:
+                            automatic_stop_error = RuntimeError(
+                                f"JOG stop failed ({stop_exc}); Rapid Stop also "
+                                f"failed ({rapid_stop_exc})"
+                            )
+                self.position_motion_may_be_active = (
+                    controller._motion_command_may_be_active
+                )
+                self.position_jog_command_active = bool(
+                    controller._jog_active
+                    or controller._motion_command_may_be_active
+                )
+                self.update_position_control_state()
+                if automatic_stop_error is not None:
+                    exc = RuntimeError(f"{exc}; {automatic_stop_error}")
+            else:
+                self.position_jog_command_active = False
             self.handle_position_command_error(f"JOG {direction_text}", exc)
 
     def stop_position_jog(self):
-        if not self.position_jog_command_active:
+        controller_motion_may_be_active = bool(
+            self.position_monitor is not None
+            and self.position_monitor._motion_command_may_be_active
+        )
+        if not (
+            self.position_jog_command_active
+            or self.position_motion_may_be_active
+            or controller_motion_may_be_active
+        ):
             return
         try:
             controller = self.get_position_controller(require_armed=False)
             controller.stop_jog()
+            self.position_jog_command_active = False
+            self.position_motion_may_be_active = False
+            self.stop_position_motion_status_monitor()
+            self.update_position_control_state()
             self.set_mr_status_text("MR-MC240N: JOG stopped")
         except Exception as exc:
             self.handle_position_command_error("JOG stop", exc)
-        finally:
-            self.position_jog_command_active = False
 
     def stop_position_motion(self, rapid):
         action = "Rapid stop" if rapid else "Stop"
         automatic_test_active = self.live_motion_cycle_active
+        motion_was_uncertain = bool(
+            automatic_test_active
+            or self.position_jog_command_active
+            or self.position_motion_may_be_active
+            or (
+                self.position_monitor is not None
+                and self.position_monitor._motion_command_may_be_active
+            )
+        )
         try:
             controller = self.get_position_controller(require_armed=False)
             controller.stop(rapid=rapid)
             self.position_jog_command_active = False
+            self.position_motion_may_be_active = False
+            self.stop_position_motion_status_monitor()
+            self.update_position_control_state()
             self.set_mr_status_text(f"MR-MC240N: {action} completed")
             if automatic_test_active:
                 self.live_motion_cycle_active = False
                 self.stop_test(completed=False)
+            return True
         except Exception as exc:
+            controller_motion_may_be_active = bool(
+                self.position_monitor is not None
+                and self.position_monitor._motion_command_may_be_active
+            )
+            self.position_motion_may_be_active = (
+                motion_was_uncertain or controller_motion_may_be_active
+            )
+            self.update_position_control_state()
             self.handle_position_command_error(action, exc)
+            return False
 
     def refresh_position_axis_status(self):
         self.position_axis_status_checked = False
@@ -2823,6 +3278,13 @@ class ClampTestMachineApp(QMainWindow):
                     )
 
                     if axis == selected_axis:
+                        if (
+                            not axis_status["operating"]
+                            and axis_status["operation_complete"]
+                            and not controller._motion_command_may_be_active
+                        ):
+                            self.position_motion_may_be_active = False
+                            self.update_position_control_state()
                         self.position_axis_status_checked = True
                         self.position_axis_ready = short_state == "READY"
                         self.position_readiness_detail = {
@@ -3013,12 +3475,18 @@ class ClampTestMachineApp(QMainWindow):
         distance_counts = round(distance_mm * config["counts_per_mm"])
         if distance_counts == 0:
             raise RuntimeError("이동량이 1 command unit 미만입니다.")
-        controller.move_relative(
-            distance_counts,
-            config["speed_mm_min"],
-            config["acceleration_ms"],
-            config["deceleration_ms"],
-        )
+        try:
+            controller.move_relative(
+                distance_counts,
+                config["speed_mm_min"],
+                config["acceleration_ms"],
+                config["deceleration_ms"],
+            )
+        finally:
+            self.position_motion_may_be_active = (
+                controller._motion_command_may_be_active
+            )
+            self.update_position_control_state()
         self.append_system_log(
             f"{state}: axis {controller.axis_number}, "
             f"{current_position_mm:.3f} → {target_mm:.3f} mm "
@@ -3199,6 +3667,7 @@ class ClampTestMachineApp(QMainWindow):
             return
 
         self.is_test_running = True
+        self.update_position_control_state()
         self.current_stroke = 0
         self.stroke_data_history = []
         self.stroke_position_history = []
@@ -3455,6 +3924,7 @@ class ClampTestMachineApp(QMainWindow):
         was_live_motion_test = self.live_motion_config is not None
         was_live_motion_active = self.live_motion_cycle_active
         live_motion_strokes = self.current_stroke
+        motion_stop_confirmed = not was_live_motion_active
 
         if (
             was_live_motion_active
@@ -3462,6 +3932,7 @@ class ClampTestMachineApp(QMainWindow):
         ):
             try:
                 self.position_monitor.stop(rapid=False, timeout_ms=3000)
+                motion_stop_confirmed = True
                 self.append_system_log(
                     "Automatic test stop command sent",
                     "MR-MC240N",
@@ -3473,20 +3944,24 @@ class ClampTestMachineApp(QMainWindow):
                 )
                 try:
                     self.position_monitor.stop(rapid=True, timeout_ms=3000)
+                    motion_stop_confirmed = True
                     self.append_system_log(
                         "Automatic test rapid stop command sent",
                         "MR-MC240N",
                     )
                 except Exception as rapid_exc:
+                    motion_stop_confirmed = False
                     self.append_system_log(
                         f"Automatic test rapid stop failed: {rapid_exc}",
                         "MR-MC240N",
                     )
+        self.position_motion_may_be_active = not motion_stop_confirmed
 
         self.is_test_running = False
         self.test_state = "IDLE"
         self.live_motion_cycle_active = False
         self.timer.stop()
+        self.update_position_control_state()
         self.update_start_button_idle_state()
 
         self.close_ni_daq_task()
@@ -3804,6 +4279,16 @@ class ClampTestMachineApp(QMainWindow):
         else:
             self.close_ni_daq_task()
             self.close_position_monitor()
+        if self.position_monitor is not None:
+            QMessageBox.critical(
+                self,
+                "MR-MC240N Stop/Close Not Confirmed",
+                "MR-MC240N의 Rapid Stop 또는 Close가 확인되지 않아 프로그램 "
+                "종료를 차단했습니다.\n\n외부 비상정지를 작동하고 실제 축 정지를 "
+                "확인한 뒤 Rapid Stop/Connect를 다시 시도하세요.",
+            )
+            event.ignore()
+            return
         super().closeEvent(event)
 
     def keyPressEvent(self, event):

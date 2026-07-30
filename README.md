@@ -130,6 +130,46 @@ python mr_mc240n_pcie_check.py
 이 유틸리티는 장치/드라이버/DLL을 점검하고 `sscOpen/sscClose`만 호출합니다.
 System Start, Servo 또는 모션 명령은 보내지 않습니다.
 
+진단기는 설치된 Utility2/API 버전을 읽고, Python 아키텍처와 맞는 DLL의
+메타데이터를 모두 검사합니다. `sscOpen/sscClose`는 앱이 실제로 선택할 DLL에만
+호출하며, 버전 불일치 파일은 `--dll`로 명시하지 않는 한 로드하지 않습니다.
+앱은 기본적으로 Utility2가 레지스트리에 등록한 DLL을
+사용합니다. 사용자가 DLL 경로를 직접 지정했다면 그 파일만 사용하며,
+실패했을 때 다른 DLL로 조용히 바꾸지 않습니다.
+
+API DLL, common driver와 PCIe driver는 반드시 같은 Mitsubishi Utility2
+설치본으로 맞춰야 합니다. API 2.00에서 Windows 10 지원이 추가되었으므로 현재
+Windows를 지원하는 정식 Utility2 3.50 이상 전체 설치본을 관리자 권한으로
+설치한 뒤 재부팅하세요. Mitsubishi 보안 공지상 Utility2 3.40 이하는 내장
+WinDriver 취약점의 영향 대상입니다.
+DLL 파일 하나만 복사해서는 내장 WinDriver 런타임 라이선스 거부나 버전 불일치를
+복구할 수 없습니다.
+PB Test의 실행 파일 버전(예: 3.8.0.0)은 Utility/API 버전과 별개입니다.
+
+Windows에서 `10BA:0624` 장치가 보이는데 모든 DLL이 `0x00021010`을 반환하면
+[PCIe_RECOVERY.md](PCIe_RECOVERY.md)를 확인하세요. 개발용 읽기 전용 추적은
+다음과 같이 실행할 수 있습니다.
+
+```powershell
+python tools\trace_pcie_open.py `
+  --dll "C:\Program Files (x86)\Position Board\MR-MC2XX\API Library\Library\mc2xxstd_x64.dll" `
+  --board-id 0 `
+  --output artifacts\pcie_open_trace.jsonl
+```
+
+진단기의 네이티브 DLL 호출은 격리된 자식 프로세스에서 실행되며, DLL이 중단되거나
+응답하지 않으면 다음 후보를 임의로 실행하지 않고 불확실 상태로 종료합니다.
+추적 도구에는 로컬 Frida 설치가 필요하고, 내장 라이선스 요청 데이터는 기록 전에
+가립니다. 라이선스 검사를 패치하거나 우회하는 용도로 사용하지 마세요. PCIe 정식 런타임을 복구하기 전에는
+`USB controller (direct)`를 명시적으로 선택할 수 있으며, 앱이 연결 방식을
+자동으로 바꾸지는 않습니다.
+
+PCIe System Start 옵션은 먼저 `sscGetSystemStatusCode`를 읽습니다. 이미 운전
+중이면 다시 시작하지 않고, System preparation completion 상태일 때만
+`sscSystemStart`를 호출합니다. SSCNET 초기화 중 이 호출은 최소 10초 대기할 수
+있습니다. 모션 가능성이 남아 있는 동안 연결 설정은 잠기며, Rapid Stop/Close
+실패 시에는 컨트롤러 참조를 유지해 정리를 다시 시도할 수 있습니다.
+
 ## 카메라
 
 일반 UVC 카메라를 연결하고 `Camera / Ring` 영역에서 카메라 인덱스, 해상도,

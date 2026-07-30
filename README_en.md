@@ -88,8 +88,47 @@ The current six-axis preset assumes:
 python mr_mc240n_pcie_check.py
 ```
 
-The diagnostic checks the device, driver, and DLL, and calls only
-`sscOpen/sscClose`. It does not send System Start, Servo, or motion commands.
+The diagnostic checks the device and driver services, reads the registered
+Utility2/API versions, and inspects every architecture-compatible DLL. It calls
+`sscOpen/sscClose` only through the DLL that the application would select;
+mismatched files are metadata-only unless supplied explicitly with `--dll`.
+It does not send System Start, Servo, or motion commands.
+
+The application automatically uses the DLL registered by the installed
+Position Board Utility2. An explicitly configured DLL path is authoritative and
+fails fast instead of silently falling back to a different file. Keep the API
+DLL, common driver, and PCIe driver from one complete Mitsubishi installation.
+API 2.00 added Windows 10 support; use a current Mitsubishi-supported package
+for the installed Windows version and reboot after installing its drivers.
+Mitsubishi's WinDriver advisory identifies Utility2 3.40 and earlier as
+affected and 3.50 or later as fixed.
+The PB Test executable version (for example, 3.8.0.0) is separate from the
+Utility/API runtime version.
+
+If Windows detects `10BA:0624` but every DLL returns `0x00021010`, see
+[PCIe_RECOVERY.md](PCIe_RECOVERY.md). A developer can capture the masked,
+lower-level driver status without sending motion commands:
+
+```powershell
+python tools\trace_pcie_open.py `
+  --dll "C:\Program Files (x86)\Position Board\MR-MC2XX\API Library\Library\mc2xxstd_x64.dll" `
+  --board-id 0 `
+  --output artifacts\pcie_open_trace.jsonl
+```
+
+The trace helper requires Frida locally. It observes the open path only and must
+not be used to patch or bypass vendor license checks. Native DLL probes run in
+an isolated child process; a timeout or crash is reported as uncertain and no
+further DLL is tried. Embedded license request data is redacted before a trace
+is recorded. Until the official PCIe runtime is repaired, select
+`USB controller (direct)` explicitly; the app never silently changes the
+connection type.
+
+The PCIe System Start option first reads `sscGetSystemStatusCode`: it leaves an
+already-running system alone and calls `sscSystemStart` only from preparation
+complete. Mitsubishi's call can wait at least 10 seconds while SSCNET is
+initialized. Connection settings are locked while motion may be active, and a
+failed Rapid Stop/Close retains the controller so cleanup can be retried.
 
 ## Camera
 

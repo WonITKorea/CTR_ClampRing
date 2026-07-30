@@ -48,5 +48,6 @@ PbTest/
 Header File/
 Library/
 .reverse_tools/
-tools/
+tools/*
+!tools/trace_pcie_open.py
 .codex

@@ -1,11 +1,15 @@
 import ctypes
 import json
 import os
-import platform
 import re
 import struct
 import subprocess
 import threading
+
+try:
+    import winreg
+except ImportError:
+    winreg = None
 
 MR_MC240N_WINDOWS_ONLY_MESSAGE = "MR-MC240N position board monitoring is supported only on Windows."
 MR_MC240N_USB_VID = "06D3"
@@ -14,16 +18,102 @@ MR_MC240N_USB_INSTANCE_PREFIX = f"USB\\VID_{MR_MC240N_USB_VID}&PID_{MR_MC240N_US
 MR_MC240N_USB_DEVICE_NAME = "MITSUBISHI SSCNET Unit USB Controller"
 MR_CONNECTION_USB_MAINTENANCE = "USB controller (direct)"
 MR_CONNECTION_PCIE_API = "PCIe control (API)"
+MR_MC240N_REQUIRED_API_EXPORTS = (
+    "sscOpen",
+    "sscClose",
+    "sscGetLastError",
+    "sscSystemStart",
+    "sscGetSystemStatusCode",
+    "sscGetCurrentFbPositionFast",
+    "sscSetCommandBitSignalEx",
+    "sscGetStatusBitSignalEx",
+    "sscJogStart",
+    "sscJogStop",
+    "sscIncStart",
+    "sscHomeReturnStart",
+    "sscDriveStop",
+    "sscDriveRapidStop",
+)
 
 MR_MC240N_API_ERROR_MESSAGES = {
+    0xFFFFFFFF: "unknown API failure (SSC_FUNC_ERR_UNKNOWN)",
+    0xFFFFFFFE: "unsupported operating system (SSC_FUNC_ERR_UNSURPORT_OS)",
+    0x00000100: "API argument combination mismatch (SSC_FUNC_ERR_ARGUMENT_MISMATCH)",
+    0x00010000: "API timeout (SSC_FUNC_ERR_TIMEOUT_01)",
+    0x00010100: "API timeout (SSC_FUNC_ERR_TIMEOUT_02)",
+    0x00010200: "API timeout (SSC_FUNC_ERR_TIMEOUT_03)",
+    0x00010300: "API timeout (SSC_FUNC_ERR_TIMEOUT_04)",
+    0x00010400: "API timeout (SSC_FUNC_ERR_TIMEOUT_05)",
+    0x00010500: "API timeout (SSC_FUNC_ERR_TIMEOUT_06)",
+    0x00010600: "API timeout (SSC_FUNC_ERR_TIMEOUT_07)",
+    0x00010700: "API timeout (SSC_FUNC_ERR_TIMEOUT_08)",
+    0x00010800: "API timeout (SSC_FUNC_ERR_TIMEOUT_09)",
+    0x00020000: "board is already open (SSC_FUNC_ERR_REOPEN)",
+    0x00020010: "board is not open (SSC_FUNC_ERR_UNOPEN)",
     0x00021010: "position board not found (SSC_FUNC_ERR_NOT_FOUND_BOARD)",
+    0x00021011: "could not read the channel count (SSC_FUNC_ERR_GET_CHANNEL_NUM)",
+    0x00021012: "unsupported device driver (SSC_FUNC_ERR_UNSUPPORT_DEVICE_DRIVER)",
+    0x00023000: "device-driver operation failed (SSC_FUNC_ERR_DEVICE_DRIVER)",
+    0x00030000: "system is not preparation-complete; reboot may be required (SSC_FUNC_ERR_UNREADY_CHANNEL)",
+    0x00030010: "channel is already configured (SSC_FUNC_ERR_ALREADY_CHANNEL)",
+    0x00030020: "system is waiting for System Start (SSC_FUNC_ERR_RUNNING_CHANNEL)",
+    0x00030030: "position-board system alarm is active (SSC_FUNC_ERR_NOW_ALARM_SYSTEM)",
+    0x00060010: "axis is currently driving (SSC_FUNC_ERR_NOW_DRIVING)",
+    0x00060011: "axis is not drive-ready (SSC_FUNC_ERR_NOW_DRIVING_READY)",
+    0x00060020: "servo alarm is active (SSC_FUNC_ERR_NOW_ALARM_SERVO)",
+    0x00060030: "drive alarm is active (SSC_FUNC_ERR_NOW_ALARM_DRIVE)",
 }
+MR_MC240N_API_ERROR_MESSAGES.update(
+    {
+        argument_number: (
+            f"API argument {argument_number} is invalid "
+            f"(SSC_FUNC_ERR_ARGUMENT_{argument_number:02d})"
+        )
+        for argument_number in range(1, 10)
+    }
+)
 
 
 def describe_mr_mc240n_api_error(error_code):
-    error_code = int(error_code)
+    error_code = int(error_code) & 0xFFFFFFFF
     description = MR_MC240N_API_ERROR_MESSAGES.get(error_code, "unknown API error")
     return f"0x{error_code:08X}: {description}"
+
+
+def get_position_board_api_library_directory():
+    """Return the API Library directory registered by Position Board Utility2."""
+    if os.name != "nt" or winreg is None:
+        return ""
+
+    registry_queries = [
+        (
+            r"SOFTWARE\MITSUBISHI\PositionBoardUtility2",
+            getattr(winreg, "KEY_WOW64_32KEY", 0),
+        ),
+        (
+            r"SOFTWARE\WOW6432Node\MITSUBISHI\PositionBoardUtility2",
+            0,
+        ),
+    ]
+    for registry_path, view_flag in registry_queries:
+        try:
+            access = winreg.KEY_READ | view_flag
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                registry_path,
+                0,
+                access,
+            ) as key:
+                install_path = str(winreg.QueryValueEx(key, "InstallPath")[0]).strip()
+        except OSError:
+            continue
+        if install_path:
+            return os.path.join(
+                os.path.abspath(os.path.expandvars(install_path)),
+                "API Library",
+                "Library",
+            )
+    return ""
 
 
 def detect_mr_mc240n_usb_controller():
@@ -122,6 +212,12 @@ class MrMc240nUsbController:
         self.board_signature = None
         self.system_status_code = None
         self._jog_active = False
+        self._motion_command_may_be_active = False
+        self._motion_seen_operating = False
+        self._motion_seen_incomplete = False
+        self._motion_dispatch_confirmed = False
+        self._motion_start_position = None
+        self._motion_kind = ""
 
     @staticmethod
     def is_supported_platform():
@@ -254,7 +350,7 @@ class MrMc240nUsbController:
     def read_axis_status(self, axis_number=None):
         axis = self.axis_number if axis_number is None else int(axis_number)
         response = self._request(f"AXIS_STATE {axis}")
-        return {
+        status = {
             "axis": axis,
             "position": int(response["position"]),
             "status0": int(response["status0"]),
@@ -267,6 +363,62 @@ class MrMc240nUsbController:
             "operation_alarm": bool(response["operation_alarm"]),
             "operation_complete": not bool(response["operating"]),
         }
+        self._update_motion_latch_from_status(status)
+        return status
+
+    def _begin_motion_dispatch(self, start_position, motion_kind):
+        self._motion_seen_operating = False
+        self._motion_seen_incomplete = False
+        self._motion_dispatch_confirmed = False
+        self._motion_start_position = int(start_position)
+        self._motion_kind = str(motion_kind)
+        self._motion_command_may_be_active = True
+
+    def _confirm_motion_dispatch(self):
+        self._motion_dispatch_confirmed = True
+
+    def _clear_motion_latch(self):
+        self._motion_command_may_be_active = False
+        self._motion_seen_operating = False
+        self._motion_seen_incomplete = False
+        self._motion_dispatch_confirmed = False
+        self._motion_start_position = None
+        self._motion_kind = ""
+
+    def _update_motion_latch_from_status(self, status):
+        if (
+            int(status["axis"]) != self.axis_number
+            or not self._motion_command_may_be_active
+        ):
+            return
+        if status["operating"]:
+            self._motion_seen_operating = True
+        if not status["operation_complete"]:
+            self._motion_seen_incomplete = True
+        position_changed = (
+            self._motion_start_position is not None
+            and int(status["position"]) != self._motion_start_position
+        )
+        position_completion_confirmed = (
+            self._motion_dispatch_confirmed
+            and position_changed
+            and (
+                (self._motion_kind == "relative" and status["in_position"])
+                or (self._motion_kind == "home" and status["home_complete"])
+            )
+        )
+        completion_observed = (
+            self._motion_seen_operating
+            or self._motion_seen_incomplete
+            or position_completion_confirmed
+        )
+        if (
+            not status["operating"]
+            and status["operation_complete"]
+            and completion_observed
+        ):
+            self._jog_active = False
+            self._clear_motion_latch()
 
     def set_servo_on(self, enabled):
         self._request(f"SERVO {self.axis_number} {1 if enabled else 0}")
@@ -276,53 +428,61 @@ class MrMc240nUsbController:
     def start_jog(self, direction, speed, acceleration_ms, deceleration_ms):
         if direction not in (self.SSC_DIR_PLUS, self.SSC_DIR_MINUS):
             raise ValueError("JOG direction must be plus or minus.")
+        start_position = self.read_feedback_position_counts()
+        self._begin_motion_dispatch(start_position, "jog")
         self._request(
             f"JOG {self.axis_number} {int(direction)} {int(speed)} "
             f"{int(acceleration_ms)} {int(deceleration_ms)}"
         )
+        self._confirm_motion_dispatch()
         self._jog_active = True
 
     def stop_jog(self, timeout_ms=3000):
         self._request(f"STOP {self.axis_number}")
         self._jog_active = False
+        self._clear_motion_latch()
 
     def move_relative(self, distance_counts, speed, acceleration_ms, deceleration_ms):
+        start_position = self.read_feedback_position_counts()
+        self._begin_motion_dispatch(start_position, "relative")
         self._request(
             f"MOVE_RELATIVE {self.axis_number} {int(distance_counts)} {int(speed)} "
             f"{int(acceleration_ms)} {int(deceleration_ms)}"
         )
+        self._confirm_motion_dispatch()
 
     def start_home_return(self):
+        start_position = self.read_feedback_position_counts()
+        self._begin_motion_dispatch(start_position, "home")
         self._request(f"HOME {self.axis_number}")
+        self._confirm_motion_dispatch()
 
     def stop(self, rapid=False, timeout_ms=3000):
         command = "RAPID_STOP" if rapid else "STOP"
         self._request(f"{command} {self.axis_number}")
         self._jog_active = False
+        self._clear_motion_latch()
 
 
 class MrMc240nPositionController:
     """ctypes wrapper for MR-MC200 monitoring and standard-mode axis control."""
 
-    DEFAULT_LIBRARY_CANDIDATES = (
-        "mc2xxstd_x64.dll",
-        "mc2xxstd.dll",
-    )
-
     SSC_BIT_OFF = 0
     SSC_BIT_ON = 1
     SSC_DIR_PLUS = 0
     SSC_DIR_MINUS = 1
+    SSC_STS_CODE_READY_FIN = 0x0001
+    SSC_STS_CODE_RUNNING = 0x000A
 
     # mc2xxstd.h axis command/status bit numbers.
-    SSC_CMDBIT_AX_SON = 1
-    SSC_STSBIT_AX_RDY = 1
-    SSC_STSBIT_AX_INP = 2
-    SSC_STSBIT_AX_SALM = 6
-    SSC_STSBIT_AX_OP = 9
-    SSC_STSBIT_AX_ZP = 12
-    SSC_STSBIT_AX_OALM = 14
-    SSC_STSBIT_AX_OPF = 15
+    SSC_CMDBIT_AX_SON = 513
+    SSC_STSBIT_AX_RDY = 769
+    SSC_STSBIT_AX_INP = 770
+    SSC_STSBIT_AX_SALM = 774
+    SSC_STSBIT_AX_OP = 777
+    SSC_STSBIT_AX_ZP = 780
+    SSC_STSBIT_AX_OALM = 782
+    SSC_STSBIT_AX_OPF = 783
 
     def __init__(self, board_id, axis_number, dll_path="", auto_start_system=False):
         self.board_id = int(board_id)
@@ -331,67 +491,134 @@ class MrMc240nPositionController:
         self.dll_path = dll_path.strip()
         self.auto_start_system = bool(auto_start_system)
         self.library = None
+        self.loaded_library_path = ""
+        self._library_validation_error = ""
+        self._open_cleanup_pending = ""
         self._is_open = False
         self._system_start_attempted = False
+        self.system_status_code = None
         self._servo_commanded_on = False
         self._jog_active = False
+        self._motion_command_may_be_active = False
+        self._motion_seen_operating = False
+        self._motion_seen_incomplete = False
+        self._motion_dispatch_confirmed = False
+        self._motion_start_position = None
+        self._motion_kind = ""
 
     @staticmethod
     def is_supported_platform():
         return os.name == "nt"
 
-    def _bind_api(self, name, argtypes):
+    def _bind_api(self, name, argtypes, restype=ctypes.c_int):
         try:
             function = getattr(self.library, name)
         except AttributeError:
             return
         function.argtypes = argtypes
-        function.restype = ctypes.c_int
+        function.restype = restype
+
+    def _library_candidates(self):
+        python_is_64_bit = ctypes.sizeof(ctypes.c_void_p) == 8
+        library_names = (
+            ("mc2xxstd_x64.dll",)
+            if python_is_64_bit
+            else ("mc2xxstd_wow64.dll", "mc2xxstd.dll")
+        )
+
+        if self.dll_path:
+            return [
+                os.path.abspath(
+                    os.path.expanduser(os.path.expandvars(self.dll_path))
+                )
+            ]
+
+        module_dir = os.path.dirname(os.path.abspath(__file__))
+        installed_library_dir = get_position_board_api_library_directory()
+        if installed_library_dir:
+            candidate_directories = [installed_library_dir]
+        else:
+            candidate_directories = [
+                os.path.join(module_dir, "vendor", "mitsubishi"),
+                module_dir,
+            ]
+
+        candidates = []
+        for directory in candidate_directories:
+            for library_name in library_names:
+                candidates.append(os.path.join(directory, library_name))
+
+        unique_candidates = []
+        seen = set()
+        for candidate in candidates:
+            normalized = os.path.normcase(os.path.abspath(candidate))
+            if normalized in seen:
+                continue
+            unique_candidates.append(candidate)
+            seen.add(normalized)
+        return unique_candidates
 
     def _load_library(self):
         if not self.is_supported_platform():
             raise RuntimeError(MR_MC240N_WINDOWS_ONLY_MESSAGE)
 
+        if self._library_validation_error:
+            raise RuntimeError(self._library_validation_error)
         if self.library is not None:
             return
 
-        library_candidates = []
-        if self.dll_path:
-            library_candidates.append(os.path.abspath(os.path.expandvars(self.dll_path)))
-        module_dir = os.path.dirname(os.path.abspath(__file__))
-        if platform.architecture()[0] == "64bit":
-            library_names = ["mc2xxstd_x64.dll", "mc2xxstd.dll"]
-        else:
-            library_names = ["mc2xxstd.dll", "mc2xxstd_x64.dll"]
-        for library_name in library_names:
-            library_candidates.extend(
-                [
-                    os.path.join(
-                        module_dir,
-                        "vendor",
-                        "mitsubishi",
-                        library_name,
-                    ),
-                    os.path.join(module_dir, library_name),
-                    library_name,
-                ]
+        library_candidates = self._library_candidates()
+        explicit_library = bool(self.dll_path)
+        if explicit_library and not os.path.isfile(library_candidates[0]):
+            raise RuntimeError(
+                "Configured MR-MC240N API DLL was not found. "
+                f"No fallback DLL was loaded: {library_candidates[0]}"
             )
 
         load_error = None
         architecture_errors = []
+        missing_exports = []
         python_arch = "x64" if ctypes.sizeof(ctypes.c_void_p) == 8 else "x86"
         for candidate in library_candidates:
-            resolved_candidate = os.path.abspath(candidate) if os.path.isfile(candidate) else candidate
+            resolved_candidate = (
+                os.path.abspath(candidate) if os.path.isfile(candidate) else candidate
+            )
             if os.path.isfile(resolved_candidate):
                 dll_arch = get_windows_pe_architecture(resolved_candidate)
-                if dll_arch and dll_arch != python_arch:
-                    architecture_errors.append(f"{candidate} is {dll_arch}, Python is {python_arch}")
+                if not dll_arch:
+                    architecture_errors.append(f"{candidate} is not a readable PE DLL")
+                    if explicit_library:
+                        break
+                    continue
+                if dll_arch != python_arch:
+                    architecture_errors.append(
+                        f"{candidate} is {dll_arch}, Python is {python_arch}"
+                    )
+                    if explicit_library:
+                        break
                     continue
             try:
-                self.library = ctypes.WinDLL(resolved_candidate)
+                loaded_library = ctypes.WinDLL(resolved_candidate)
+                missing_exports = [
+                    name
+                    for name in MR_MC240N_REQUIRED_API_EXPORTS
+                    if not hasattr(loaded_library, name)
+                ]
+                self.library = loaded_library
+                self.loaded_library_path = resolved_candidate
                 break
             except Exception as exc:
                 load_error = exc
+                if explicit_library:
+                    break
+
+        if self.library is not None and missing_exports:
+            self._library_validation_error = (
+                "MR-MC240N API DLL loaded but is missing required exports: "
+                + ", ".join(missing_exports)
+                + f". No fallback DLL was selected: {self.loaded_library_path}"
+            )
+            raise RuntimeError(self._library_validation_error)
 
         if self.library is None:
             architecture_hint = ""
@@ -399,14 +626,25 @@ class MrMc240nPositionController:
                 architecture_hint = " Architecture mismatch: " + "; ".join(architecture_errors) + "."
             raise RuntimeError(
                 "MR-MC240N API library could not be loaded. "
-                "Use mc2xxstd_x64.dll with 64-bit Python or mc2xxstd.dll with 32-bit Python."
+                "Use mc2xxstd_x64.dll with 64-bit Python or "
+                "mc2xxstd_wow64.dll with 32-bit Python. "
+                "Install one complete Position Board Utility2 runtime; "
+                "copying a DLL from a different release is not sufficient."
                 + architecture_hint
             ) from load_error
 
         self._bind_api("sscOpen", [ctypes.c_int])
         self._bind_api("sscClose", [ctypes.c_int])
-        self._bind_api("sscGetLastError", [])
+        self._bind_api("sscGetLastError", [], ctypes.c_uint32)
         self._bind_api("sscSystemStart", [ctypes.c_int, ctypes.c_int, ctypes.c_int])
+        self._bind_api(
+            "sscGetSystemStatusCode",
+            [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_short),
+            ],
+        )
         self._bind_api(
             "sscGetCurrentFbPositionFast",
             [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_long)],
@@ -439,7 +677,7 @@ class MrMc240nPositionController:
         )
         self._bind_api(
             "sscJogStop",
-            [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int],
+            [ctypes.c_int, ctypes.c_int, ctypes.c_int],
         )
         self._bind_api(
             "sscIncStart",
@@ -478,7 +716,9 @@ class MrMc240nPositionController:
             raise RuntimeError(f"{action} failed. API status={status_code}.")
         raise RuntimeError(
             f"{action} failed. API status={status_code}, "
-            f"detail={describe_mr_mc240n_api_error(detailed_error)}."
+            f"detail={describe_mr_mc240n_api_error(detailed_error)}. "
+            "Run `python mr_mc240n_pcie_check.py`; keep the API DLL and "
+            "Mitsubishi drivers from the same Utility2 installation."
         )
 
     def _get_api(self, name):
@@ -492,14 +732,20 @@ class MrMc240nPositionController:
                 "Install the API library supplied with the current Position Board Utility2."
             ) from exc
 
-    def _call_api(self, name, *args):
-        self.open()
+    def _call_api(self, name, *args, allow_cleanup_pending=False):
+        if allow_cleanup_pending and self._open_cleanup_pending:
+            if not self._is_open:
+                raise RuntimeError(self._open_cleanup_pending)
+        else:
+            self.open()
         status = self._get_api(name)(*args)
         if status != 0:
             self._raise_api_error(name, status)
 
     def open(self):
         self._load_library()
+        if self._open_cleanup_pending:
+            raise RuntimeError(self._open_cleanup_pending)
         if self._is_open:
             return
 
@@ -508,28 +754,79 @@ class MrMc240nPositionController:
             self._raise_api_error("sscOpen", status)
 
         self._is_open = True
+        try:
+            self.ensure_running_if_requested()
+        except Exception as start_error:
+            cleanup_error = ""
+            try:
+                close_status = self.library.sscClose(self.board_id)
+                if close_status != 0:
+                    cleanup_error = f"sscClose returned {close_status}"
+            except Exception as close_error:
+                cleanup_error = f"sscClose raised {close_error}"
+
+            if not cleanup_error:
+                self._is_open = False
+                self._system_start_attempted = False
+                raise
+            self._open_cleanup_pending = (
+                f"{start_error} Cleanup also failed ({cleanup_error}); "
+                "the board may still be open, so call close() again."
+            )
+            raise RuntimeError(self._open_cleanup_pending) from start_error
 
     def close(self):
         if not self._is_open or self.library is None:
             return
         try:
             status = self.library.sscClose(self.board_id)
-            if status != 0:
-                self._raise_api_error("sscClose", status)
-        finally:
-            self._is_open = False
-            self._system_start_attempted = False
-            self._servo_commanded_on = False
-            self._jog_active = False
+        except Exception as exc:
+            self._open_cleanup_pending = (
+                f"sscClose raised {exc}; the board may still be open. "
+                "Retry Rapid Stop/close before other API calls."
+            )
+            raise
+        if status != 0:
+            self._open_cleanup_pending = (
+                f"sscClose failed with API status {status}; the board may "
+                "still be open. Retry Rapid Stop/close before other API calls."
+            )
+            self._raise_api_error("sscClose", status)
+        self._is_open = False
+        self._open_cleanup_pending = ""
+        self._system_start_attempted = False
+        self.system_status_code = None
+        self._servo_commanded_on = False
+        self._jog_active = False
 
     def ensure_running_if_requested(self):
         if not self.auto_start_system or self._system_start_attempted:
             return
 
-        status = self.library.sscSystemStart(self.board_id, self.channel, 0)
+        system_status = ctypes.c_short()
+        status = self._get_api("sscGetSystemStatusCode")(
+            self.board_id,
+            self.channel,
+            ctypes.byref(system_status),
+        )
+        if status != 0:
+            self._raise_api_error("sscGetSystemStatusCode", status)
+
+        self.system_status_code = int(system_status.value) & 0xFFFF
         self._system_start_attempted = True
+        if self.system_status_code == self.SSC_STS_CODE_RUNNING:
+            return
+        if self.system_status_code != self.SSC_STS_CODE_READY_FIN:
+            raise RuntimeError(
+                "sscSystemStart was not sent because the system is neither "
+                "preparation-complete nor already running "
+                f"(status=0x{self.system_status_code:04X}). "
+                "Mitsubishi requires a system reboot before starting again."
+            )
+        status = self._get_api("sscSystemStart")(self.board_id, self.channel, 0)
         if status != 0:
             self._raise_api_error("sscSystemStart", status)
+        self.system_status_code = self.SSC_STS_CODE_RUNNING
 
     def read_feedback_position_counts(self, axis_number=None):
         self.open()
@@ -619,16 +916,72 @@ class MrMc240nPositionController:
         }
         status["axis"] = axis
         status["position"] = self.read_feedback_position_counts(axis)
+        self._update_motion_latch_from_status(status)
         return status
 
+    def _begin_motion_dispatch(self, start_position, motion_kind):
+        self._motion_seen_operating = False
+        self._motion_seen_incomplete = False
+        self._motion_dispatch_confirmed = False
+        self._motion_start_position = int(start_position)
+        self._motion_kind = str(motion_kind)
+        self._motion_command_may_be_active = True
+
+    def _confirm_motion_dispatch(self):
+        self._motion_dispatch_confirmed = True
+
+    def _clear_motion_latch(self):
+        self._motion_command_may_be_active = False
+        self._motion_seen_operating = False
+        self._motion_seen_incomplete = False
+        self._motion_dispatch_confirmed = False
+        self._motion_start_position = None
+        self._motion_kind = ""
+
+    def _update_motion_latch_from_status(self, status):
+        if (
+            int(status["axis"]) != self.axis_number
+            or not self._motion_command_may_be_active
+        ):
+            return
+        if status["operating"]:
+            self._motion_seen_operating = True
+        if not status["operation_complete"]:
+            self._motion_seen_incomplete = True
+        position_changed = (
+            self._motion_start_position is not None
+            and int(status["position"]) != self._motion_start_position
+        )
+        position_completion_confirmed = (
+            self._motion_dispatch_confirmed
+            and position_changed
+            and (
+                (self._motion_kind == "relative" and status["in_position"])
+                or (self._motion_kind == "home" and status["home_complete"])
+            )
+        )
+        completion_observed = (
+            self._motion_seen_operating
+            or self._motion_seen_incomplete
+            or position_completion_confirmed
+        )
+        if (
+            not status["operating"]
+            and status["operation_complete"]
+            and completion_observed
+        ):
+            self._jog_active = False
+            self._clear_motion_latch()
+
     def start_jog(self, direction, speed, acceleration_ms, deceleration_ms):
-        self.read_feedback_position_counts()
         speed, acceleration_ms, deceleration_ms = self._validate_motion_values(
             speed, acceleration_ms, deceleration_ms
         )
         if direction not in (self.SSC_DIR_PLUS, self.SSC_DIR_MINUS):
             raise ValueError("Jog direction must be SSC_DIR_PLUS or SSC_DIR_MINUS.")
 
+        start_position = self.read_feedback_position_counts()
+        self._begin_motion_dispatch(start_position, "jog")
         self._call_api(
             "sscJogStart",
             self.board_id,
@@ -639,9 +992,12 @@ class MrMc240nPositionController:
             deceleration_ms,
             bytes([direction]),
         )
+        self._confirm_motion_dispatch()
         self._jog_active = True
 
     def stop_jog(self, timeout_ms=3000):
+        # The public method retains timeout_ms for the shared USB/PCIe interface.
+        # Mitsubishi's PCIe sscJogStop ABI has exactly three arguments.
         timeout_ms = int(timeout_ms)
         if not 0 <= timeout_ms <= 65_535:
             raise ValueError("Stop timeout must be between 0 and 65535 ms.")
@@ -650,12 +1006,13 @@ class MrMc240nPositionController:
             self.board_id,
             self.channel,
             self.axis_number,
-            timeout_ms,
+            allow_cleanup_pending=True,
         )
         self._jog_active = False
+        self._clear_motion_latch()
 
     def move_relative(self, distance_counts, speed, acceleration_ms, deceleration_ms):
-        self.read_feedback_position_counts()
+        start_position = self.read_feedback_position_counts()
         distance_counts = int(distance_counts)
         if not -2_147_483_647 <= distance_counts <= 2_147_483_647:
             raise ValueError("Relative distance exceeds the signed 32-bit command range.")
@@ -665,6 +1022,7 @@ class MrMc240nPositionController:
             speed, acceleration_ms, deceleration_ms
         )
 
+        self._begin_motion_dispatch(start_position, "relative")
         self._call_api(
             "sscIncStart",
             self.board_id,
@@ -675,15 +1033,18 @@ class MrMc240nPositionController:
             acceleration_ms,
             deceleration_ms,
         )
+        self._confirm_motion_dispatch()
 
     def start_home_return(self):
-        self.read_feedback_position_counts()
+        start_position = self.read_feedback_position_counts()
+        self._begin_motion_dispatch(start_position, "home")
         self._call_api(
             "sscHomeReturnStart",
             self.board_id,
             self.channel,
             self.axis_number,
         )
+        self._confirm_motion_dispatch()
 
     def stop(self, rapid=False, timeout_ms=3000):
         timeout_ms = int(timeout_ms)
@@ -696,8 +1057,10 @@ class MrMc240nPositionController:
             self.channel,
             self.axis_number,
             timeout_ms,
+            allow_cleanup_pending=True,
         )
         self._jog_active = False
+        self._clear_motion_latch()
 
 
 # Backward-compatible name for integrations that imported the original monitor.
