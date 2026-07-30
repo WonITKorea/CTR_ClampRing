@@ -1245,7 +1245,8 @@ class ClampTestMachineApp(QMainWindow):
         )
         self.chk_camera_auto_record.setToolTip(
             "카메라가 열려 있으면 시험 시작과 함께 사용자 Videos 폴더에 "
-            "오버레이 포함 AVI 영상을 저장합니다."
+            "CTR_ClampRing_Recordings 폴더를 만들고 시험 정보가 포함된 이름으로 "
+            "오버레이 AVI 영상을 저장합니다."
         )
         layout_camera.addWidget(
             self.chk_camera_auto_record,
@@ -1357,6 +1358,10 @@ class ClampTestMachineApp(QMainWindow):
         self.btn_camera_record = QPushButton("녹화 시작")
         self.btn_camera_record.clicked.connect(self.toggle_camera_recording)
         self.btn_camera_record.setEnabled(False)
+        self.btn_camera_record.setToolTip(
+            "사용자 Videos/CTR_ClampRing_Recordings 폴더에 촬영 시작 시각과 "
+            "클램프링 정보가 포함된 이름으로 자동 저장합니다."
+        )
         camera_actions.addWidget(self.btn_camera_record)
         for camera_action_button in (
             self.btn_camera_toggle,
@@ -1590,6 +1595,70 @@ class ClampTestMachineApp(QMainWindow):
             return
         self.start_camera_recording()
 
+    @staticmethod
+    def sanitize_recording_name_part(value, fallback, max_length=32):
+        cleaned = "".join(
+            character
+            if character.isalnum() or character in {"-", "_", "."}
+            else "_"
+            for character in str(value).strip()
+        )
+        while "__" in cleaned:
+            cleaned = cleaned.replace("__", "_")
+        cleaned = cleaned.strip(" ._-")
+        return (cleaned or fallback)[:max_length]
+
+    def get_camera_recording_directory(self):
+        movies_directory = QStandardPaths.writableLocation(
+            QStandardPaths.MoviesLocation
+        )
+        if not movies_directory:
+            movies_directory = APP_DIRECTORY
+        recording_directory = os.path.join(
+            movies_directory,
+            "CTR_ClampRing_Recordings",
+        )
+        os.makedirs(recording_directory, exist_ok=True)
+        return recording_directory
+
+    def build_camera_recording_path(self, started_at=None):
+        started_at = started_at or datetime.now()
+        timestamp = started_at.strftime("%Y%m%d_%H%M%S")
+        report_no = self.sanitize_recording_name_part(
+            self.in_report_no.text(), "NoReport", 28
+        )
+        part_no = self.sanitize_recording_name_part(
+            self.in_part_no.text(), "NoPart", 24
+        )
+        part_name = self.sanitize_recording_name_part(
+            self.in_part_name.text(), "ClampRing", 32
+        )
+        sample_no = self.sanitize_recording_name_part(
+            self.in_sample_no.text(), "1", 12
+        )
+        jig_size = self.sanitize_recording_name_part(
+            self.jig_combo.currentText(), "UnknownJig", 16
+        )
+        ring_color = self.sanitize_recording_name_part(
+            self.get_camera_ring_color_key(), "UnknownColor", 12
+        )
+        recording_name = (
+            f"ClampRing_{timestamp}_{report_no}_{part_no}_{part_name}"
+            f"_S{sample_no}_Jig{jig_size}_{ring_color}.avi"
+        )
+        recording_directory = self.get_camera_recording_directory()
+        recording_path = os.path.join(recording_directory, recording_name)
+
+        suffix = 2
+        while os.path.exists(recording_path):
+            name_without_extension, extension = os.path.splitext(recording_name)
+            recording_path = os.path.join(
+                recording_directory,
+                f"{name_without_extension}_{suffix:02d}{extension}",
+            )
+            suffix += 1
+        return recording_path
+
     def start_camera_recording(self, file_path=None, started_by_test=False):
         if self.camera_capture is None:
             QMessageBox.warning(
@@ -1599,24 +1668,34 @@ class ClampTestMachineApp(QMainWindow):
             )
             return False
 
-        if file_path is None:
-            default_name = (
-                f"ClampCamera_{datetime.now().strftime('%Y%m%d_%H%M%S')}.avi"
+        recording_started_at = datetime.now()
+        try:
+            if file_path is None:
+                file_path = self.build_camera_recording_path(
+                    recording_started_at
+                )
+            if not file_path:
+                return False
+            if not file_path.lower().endswith(".avi"):
+                file_path += ".avi"
+            file_path = os.path.abspath(file_path)
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        except OSError as exc:
+            self.append_system_log(
+                f"카메라 녹화 폴더 생성 실패: {exc}",
+                "CAMERA",
+                dedupe_seconds=0,
             )
-            file_path, _ = QFileDialog.getSaveFileName(
+            QMessageBox.warning(
                 self,
-                "카메라 녹화 파일 저장",
-                default_name,
-                "AVI Video (*.avi)",
+                "Recording Error",
+                f"영상 저장 폴더를 만들 수 없습니다.\n{exc}",
             )
-        if not file_path:
             return False
-        if not file_path.lower().endswith(".avi"):
-            file_path += ".avi"
 
         self.stop_camera_recording(notify=False)
-        self.camera_recording_path = os.path.abspath(file_path)
-        self.camera_recording_started_at = datetime.now()
+        self.camera_recording_path = file_path
+        self.camera_recording_started_at = recording_started_at
         self.camera_recording_frame_count = 0
         self.camera_recording_started_by_test = bool(started_by_test)
         self.camera_video_writer = None
@@ -1640,27 +1719,7 @@ class ClampTestMachineApp(QMainWindow):
             )
             return False
 
-        movies_directory = QStandardPaths.writableLocation(
-            QStandardPaths.MoviesLocation
-        )
-        if not movies_directory:
-            movies_directory = APP_DIRECTORY
-        recording_directory = os.path.join(
-            movies_directory,
-            "CTR_ClampRing_Recordings",
-        )
-        os.makedirs(recording_directory, exist_ok=True)
-        safe_sample_no = "".join(
-            character
-            for character in self.in_sample_no.text().strip()
-            if character.isalnum() or character in {"-", "_"}
-        ) or "sample"
-        recording_name = (
-            f"ClampCamera_{self.test_start_ts or datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            f"_{safe_sample_no}.avi"
-        )
         return self.start_camera_recording(
-            os.path.join(recording_directory, recording_name),
             started_by_test=True,
         )
 

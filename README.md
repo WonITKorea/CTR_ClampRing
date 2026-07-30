@@ -188,7 +188,9 @@ PCIe System Start 옵션은 먼저 `sscGetSystemStatusCode`를 읽습니다. 이
 
 Viewfinder의 `녹화 시작/정지` 버튼은 측정 오버레이가 포함된 MJPG AVI를
 저장합니다. 설정에서 자동 녹화를 켜면 시험 시작/종료와 연동되며 사용자
-Videos 폴더 아래 `CTR_ClampRing_Recordings`에 저장됩니다.
+Videos 폴더 아래 `CTR_ClampRing_Recordings`에 저장됩니다. 수동/자동 녹화
+모두 저장 폴더를 자동으로 만들며 파일명에는 촬영 시작 시각, 관리번호, 품번,
+품명, 시료번호, Jig 크기와 링 색상이 포함됩니다.
 
 ## 안전 하중 및 결과 검토
 
