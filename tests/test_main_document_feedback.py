@@ -15,6 +15,7 @@ from PyQt5.QtWidgets import QApplication, QGroupBox, QLabel, QSizePolicy
 
 from main import (
     AXIS_TRAVEL_MAX_MM,
+    CAMERA_RECORDING_DIRECTORY,
     CTR_LOGO_HEADER_HEIGHT,
     CTR_LOGO_MAX_WIDTH,
     MOTION_RAMP_MAX_MS,
@@ -342,6 +343,24 @@ class DocumentFeedbackTests(unittest.TestCase):
         self.assertTrue(started)
         writer.write.assert_called_once()
         writer.release.assert_called_once()
+
+    def test_camera_recording_directory_is_d_video(self):
+        expected_directory = os.path.normpath(r"D:\video")
+        self.assertEqual(
+            os.path.normpath(CAMERA_RECORDING_DIRECTORY),
+            expected_directory,
+        )
+
+        with patch("main.os.makedirs") as make_directories:
+            recording_directory = (
+                self.window.get_camera_recording_directory()
+            )
+
+        self.assertEqual(recording_directory, expected_directory)
+        make_directories.assert_called_once_with(
+            expected_directory,
+            exist_ok=True,
+        )
 
     def test_completed_graph_can_be_sorted_by_position(self):
         self.window.time_series_data = [
