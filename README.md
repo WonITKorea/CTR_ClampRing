@@ -43,8 +43,7 @@ vendor/mitsubishi/            로컬 전용 Mitsubishi 런타임 위치
 ```
 
 PB Test, Mitsubishi DLL/라이브러리, 역분석 도구와 진단 트레이스는 라이선스 및
-용량 문제로 Git에 포함하지 않습니다. 기존 로컬 파일은 삭제되지 않으며
-`.gitignore`에서만 제외됩니다.
+용량 문제로 Git에 포함하지 않습니다. 
 
 ## FC400 + NI USB-6002
 
