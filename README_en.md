@@ -147,8 +147,8 @@ baseline, and record major/minor diameter, ovality, and baseline deformation.
 The project uses `opencv-python-headless` to avoid Qt plugin conflicts.
 
 The Viewfinder recording button writes an overlayed MJPG AVI. Optional automatic
-recording starts and stops with a test and saves under
-`Videos/CTR_ClampRing_Recordings`. Manual and automatic recording both create
+recording starts and stops with a test and saves under `D:\video`.
+Manual and automatic recording both create
 the folder as needed and use a filename containing the recording start time,
 report number, part number/name, sample number, jig size, and ring color.
 

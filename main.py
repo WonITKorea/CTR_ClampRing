@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QFileDialog, QMessageBox, QPlainTextEdit, QDialog,
                              QDialogButtonBox, QTabWidget, QSlider,
                              QAbstractItemView)
-from PyQt5.QtCore import QLocale, QSize, QStandardPaths, Qt, QTimer
+from PyQt5.QtCore import QLocale, QSize, Qt, QTimer
 from PyQt5.QtGui import QDoubleValidator, QIcon, QImage, QIntValidator, QPixmap
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
@@ -35,6 +35,7 @@ APP_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
 CTR_LOGO_PATH = os.path.join(APP_DIRECTORY, "Logo_CTR.png")
 CTR_LOGO_MAX_WIDTH = 150
 CTR_LOGO_HEADER_HEIGHT = 44
+CAMERA_RECORDING_DIRECTORY = r"D:\video"
 
 AXIS_TRAVEL_MIN_MM = 0.0
 AXIS_TRAVEL_MAX_MM = 196.0
@@ -1244,8 +1245,8 @@ class ClampTestMachineApp(QMainWindow):
             "시험 시작 시 카메라 자동 녹화"
         )
         self.chk_camera_auto_record.setToolTip(
-            "카메라가 열려 있으면 시험 시작과 함께 사용자 Videos 폴더에 "
-            "CTR_ClampRing_Recordings 폴더를 만들고 시험 정보가 포함된 이름으로 "
+            "카메라가 열려 있으면 시험 시작과 함께 D:\\video 폴더에 "
+            "시험 정보가 포함된 이름으로 "
             "오버레이 AVI 영상을 저장합니다."
         )
         layout_camera.addWidget(
@@ -1359,7 +1360,7 @@ class ClampTestMachineApp(QMainWindow):
         self.btn_camera_record.clicked.connect(self.toggle_camera_recording)
         self.btn_camera_record.setEnabled(False)
         self.btn_camera_record.setToolTip(
-            "사용자 Videos/CTR_ClampRing_Recordings 폴더에 촬영 시작 시각과 "
+            "D:\\video 폴더에 촬영 시작 시각과 "
             "클램프링 정보가 포함된 이름으로 자동 저장합니다."
         )
         camera_actions.addWidget(self.btn_camera_record)
@@ -1609,14 +1610,8 @@ class ClampTestMachineApp(QMainWindow):
         return (cleaned or fallback)[:max_length]
 
     def get_camera_recording_directory(self):
-        movies_directory = QStandardPaths.writableLocation(
-            QStandardPaths.MoviesLocation
-        )
-        if not movies_directory:
-            movies_directory = APP_DIRECTORY
-        recording_directory = os.path.join(
-            movies_directory,
-            "CTR_ClampRing_Recordings",
+        recording_directory = os.path.normpath(
+            CAMERA_RECORDING_DIRECTORY
         )
         os.makedirs(recording_directory, exist_ok=True)
         return recording_directory
