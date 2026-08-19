@@ -809,9 +809,13 @@ class ClampTestMachineApp(QMainWindow):
         connection_grid.addWidget(QLabel("Connection:"), 0, 0)
         self.mr_connection_combo = QComboBox()
         self.mr_connection_combo.addItems(
-            [MR_CONNECTION_USB_MAINTENANCE, MR_CONNECTION_PCIE_API]
+            [MR_CONNECTION_PCIE_API, MR_CONNECTION_USB_MAINTENANCE]
         )
-        self.mr_connection_combo.setCurrentText(MR_CONNECTION_USB_MAINTENANCE)
+        self.mr_connection_combo.setCurrentText(MR_CONNECTION_PCIE_API)
+        self.mr_connection_combo.setToolTip(
+            "PCIe API control is the primary connection. Select direct USB "
+            "explicitly only when the PCIe runtime is unavailable."
+        )
         self.mr_connection_combo.currentTextChanged.connect(
             self.on_position_connection_changed
         )
@@ -873,7 +877,7 @@ class ClampTestMachineApp(QMainWindow):
         self.chk_mr_motion_arm = QCheckBox("모션 명령 Arm")
         self.chk_mr_motion_arm.toggled.connect(self.on_position_motion_arm_toggled)
 
-        self.btn_mr_connect = QPushButton("Connect USB Controller")
+        self.btn_mr_connect = QPushButton("Connect PCIe Board")
         self.btn_mr_connect.setMinimumHeight(38)
         self.btn_mr_connect.clicked.connect(self.test_position_board_connection)
         connection_grid.addWidget(self.btn_mr_connect, 6, 0)

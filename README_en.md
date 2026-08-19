@@ -6,7 +6,7 @@ Windows/PyQt application for a six-axis clamp test machine.
 
 - Automated FC400/MR-MC240N hardware strokes with CSV and A4 PDF reports
 - UNIPULSE FC400 voltage output through an NI USB-6002
-- Mitsubishi MR-MC240N USB position feedback and guarded motion
+- Mitsubishi MR-MC240N PCIe position feedback and guarded motion, with direct USB fallback
 - UVC camera/OpenCV ring-profile measurement
 
 The app opens as a maximized window with the title bar and taskbar visible.
@@ -29,6 +29,11 @@ python main.py
 
 Running a test requires NI-DAQmx, an NI USB-6002, an MR-MC240N, and the
 matching Mitsubishi runtime.
+
+`PCIe control (API)` is the first and default MR-MC240N connection. Verify the
+Board ID and axis number, then use `Connect PCIe Board`. Direct USB control is
+an explicitly selected fallback when the PCIe runtime is unavailable. Motion
+Arm and automatic PCIe System Start remain off by default for safety.
 
 ## Repository layout
 
@@ -57,7 +62,7 @@ Select `FC400 + USB-6002` and configure the actual zero/full-scale voltages,
 capacity, unit, and sample rate. Defaults are `0 V = 0 N`, `10 V = 1000 N`,
 `Dev1/ai0`, and `1000 S/s`.
 
-## MR-MC240N direct USB control
+## MR-MC240N direct USB control (fallback)
 
 Copy the licensed 32-bit Mitsubishi runtime to:
 
@@ -92,7 +97,10 @@ position `0–196 mm`, USB speed `1–12,000 mm/min`, and acceleration/decelerat
 limits. Verify these values against the assembled machine's measured usable
 stroke and hardware limits before motion.
 
-## PCIe diagnostic
+## Primary PCIe connection and diagnostic
+
+The app defaults to `PCIe control (API)` and Board ID `0`. Run the read-only
+diagnostic first:
 
 ```powershell
 python mr_mc240n_pcie_check.py

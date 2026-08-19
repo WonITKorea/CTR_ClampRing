@@ -6,7 +6,7 @@
 
 - FC400/MR-MC240N 실장비 자동 Stroke 시험, CSV 저장 및 A4 PDF 리포트
 - UNIPULSE FC400 전압 출력 + NI USB-6002 하중 입력
-- Mitsubishi MR-MC240N USB 위치 피드백 및 6축 구동
+- Mitsubishi MR-MC240N PCIe 위치 피드백 및 6축 구동(USB 직접 제어 보조 지원)
 - UVC 카메라/OpenCV 기반 링 형상 측정
 
 앱은 제목 표시줄과 작업 표시줄이 보이는 최대화 창으로 열리며 스크롤 없는
@@ -29,6 +29,12 @@ python main.py
 
 시험 실행에는 NI-DAQmx, NI USB-6002, MR-MC240N과 해당 Mitsubishi 런타임이
 필요합니다.
+
+MR-MC240N 연결은 `PCIe control (API)`가 첫 번째 항목이자 기본값입니다.
+보드 ID와 축 번호를 확인한 뒤 `Connect PCIe Board`로 연결하세요. USB 직접
+제어는 PCIe 런타임을 사용할 수 없을 때 사용자가 명시적으로 선택하는 보조
+경로입니다. 모션 Arm과 PCIe System Start 자동 실행은 안전을 위해 기본적으로
+꺼져 있습니다.
 
 ## 저장소 구성
 
@@ -61,7 +67,7 @@ FC400 전류 출력은 USB-6002 AI에 직접 연결하지 않습니다.
 기본값은 `0 V = 0 N`, `10 V = 1000 N`, `Dev1/ai0`, `1000 S/s`입니다.
 한 개의 하중값은 6개 축에 동일하게 기록됩니다.
 
-## MR-MC240N USB 직접 제어
+## MR-MC240N USB 직접 제어(보조 경로)
 
 ### 로컬 런타임 준비
 
@@ -128,9 +134,10 @@ powershell -ExecutionPolicy Bypass -File scripts\build_usb_bridge.ps1 `
 수행합니다. 플래시 저장을 하지 않은 상태에서 보드 전원을 끄면 다시 적용해야
 할 수 있습니다.
 
-## PCIe 진단
+## PCIe 기본 연결 및 진단
 
-PCIe 경로는 별도의 읽기 전용 유틸리티로 먼저 확인할 수 있습니다.
+앱은 기본적으로 `PCIe control (API)`와 Board ID `0`을 선택합니다. PCIe 경로는
+별도의 읽기 전용 유틸리티로 먼저 확인할 수 있습니다.
 
 ```powershell
 python mr_mc240n_pcie_check.py
