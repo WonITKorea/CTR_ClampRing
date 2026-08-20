@@ -833,7 +833,7 @@ class ClampTestMachineApp(QMainWindow):
         connection_grid.addWidget(QLabel("Connection:"), 0, 0)
         self.mr_connection_combo = QComboBox()
         self.mr_connection_combo.addItems(
-            [MR_CONNECTION_USB_MAINTENANCE, MR_CONNECTION_PCIE_API]
+            [MR_CONNECTION_PCIE_API, MR_CONNECTION_USB_MAINTENANCE]
         )
         project_connection = (
             self.mr_project_config["connection"]

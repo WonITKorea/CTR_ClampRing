@@ -13,6 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt5.QtGui import QValidator
 from PyQt5.QtWidgets import QApplication, QGroupBox, QLabel, QSizePolicy
 
+from hardware import MR_CONNECTION_PCIE_API, MR_CONNECTION_USB_MAINTENANCE
 from main import (
     AXIS_TRAVEL_MAX_MM,
     CAMERA_RECORDING_DIRECTORY,
@@ -71,6 +72,18 @@ class DocumentFeedbackTests(unittest.TestCase):
                 self.window.mr_connection_combo
             )
         )
+
+    def test_pcie_is_the_primary_position_board_connection(self):
+        connection_combo = self.window.mr_connection_combo
+
+        self.assertEqual(connection_combo.currentText(), MR_CONNECTION_PCIE_API)
+        self.assertEqual(connection_combo.itemText(0), MR_CONNECTION_PCIE_API)
+        self.assertEqual(
+            connection_combo.itemText(1),
+            MR_CONNECTION_USB_MAINTENANCE,
+        )
+        self.assertEqual(self.window.btn_mr_connect.text(), "Connect PCIe Board")
+        self.assertFalse(self.window.chk_mr_auto_start.isChecked())
 
     def test_settings_tabs_have_padded_two_column_pages(self):
         self.assertGreaterEqual(
