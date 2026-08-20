@@ -643,6 +643,10 @@ static int write_btk1404_six_axis_parameters(Controller *controller)
 
         block[0x00] = axis <= 6 ? 0x0001u : 0x0000u; /* 0200 OPC1 */
         if (axis <= 6) {
+            /* Pr.0203: 0 means unassigned; amplifier axes are numbered 1..20. */
+            block[0x03] = (uint16_t)axis;
+            /* Pr.0219: no external LSP/LSN/DOG; both limits are invalid. */
+            block[0x19] = 0x0303u;
             block[0x0A] = 0x0000u; /* 020A CMX lower */
             block[0x0B] = 0x0040u; /* 020B CMX upper: 4194304 */
             block[0x0C] = 0x0FA0u; /* 020C CDV lower: 4000 um/rev */

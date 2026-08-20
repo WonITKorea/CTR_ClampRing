@@ -126,6 +126,7 @@ class PositionUiSafetyTests(unittest.TestCase):
         monitor.start_jog = Mock(side_effect=fail_after_possible_dispatch)
         monitor.stop_jog.side_effect = confirm_stop
         self.window.position_monitor = monitor
+        self.window.position_home_established = True
 
         with (
             patch.object(
@@ -150,6 +151,51 @@ class PositionUiSafetyTests(unittest.TestCase):
         monitor.stop.assert_not_called()
         self.assertFalse(self.window.position_jog_command_active)
         self.assertFalse(self.window.position_motion_may_be_active)
+
+    def test_relative_move_is_blocked_by_machine_coordinate_upper_limit(self):
+        monitor = SimpleNamespace(
+            axis_number=1,
+            _jog_active=False,
+            _motion_command_may_be_active=False,
+            read_axis_status=Mock(),
+            move_relative=Mock(),
+        )
+        self.window.position_monitor = monitor
+        self.window.position_home_established = True
+        # A display offset must never move the fixed board safety boundary.
+        self.window.position_zero_offset_mm = 50.0
+
+        with (
+            patch.object(
+                self.window,
+                "get_position_controller",
+                return_value=monitor,
+            ),
+            patch.object(
+                self.window,
+                "get_position_monitor_config",
+                return_value={"counts_per_mm": 1000.0},
+            ),
+            patch.object(
+                self.window,
+                "get_position_motion_config",
+                return_value={
+                    "speed": 100,
+                    "acceleration_ms": 10,
+                    "deceleration_ms": 10,
+                    "distance_mm": 1.0,
+                },
+            ),
+            patch.object(
+                self.window,
+                "read_position_feedback",
+                return_value=(146.0, 196_000),
+            ),
+            patch("main.QMessageBox.critical"),
+        ):
+            self.window.start_position_relative_move()
+
+        monitor.move_relative.assert_not_called()
 
     def test_stop_open_failure_does_not_invent_motion_uncertainty(self):
         self.window.position_monitor = None
@@ -183,6 +229,7 @@ class PositionUiSafetyTests(unittest.TestCase):
                 "operation_alarm": False,
                 "operating": False,
                 "operation_complete": True,
+                "position": 1_000,
             }
 
         monitor.read_axis_status = Mock(side_effect=complete_motion)

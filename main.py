@@ -28,7 +28,9 @@ from hardware import (
     MR_CONNECTION_USB_MAINTENANCE,
     MrMc240nPositionController,
     MrMc240nUsbController,
+    calculate_soft_limit_stop_margin_mm,
     detect_mr_mc240n_usb_controller,
+    load_mr_mc240n_project,
 )
 
 APP_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
@@ -36,9 +38,20 @@ CTR_LOGO_PATH = os.path.join(APP_DIRECTORY, "Logo_CTR.png")
 CTR_LOGO_MAX_WIDTH = 150
 CTR_LOGO_HEADER_HEIGHT = 44
 CAMERA_RECORDING_DIRECTORY = r"D:\video"
+MR_MC240N_PROJECT_PATHS = (
+    os.path.join(APP_DIRECTORY, "CTR.pbp2"),
+    os.path.join(APP_DIRECTORY, "Project1.pbp2"),
+)
+MR_MC240N_PROJECT_PATH = next(
+    (path for path in MR_MC240N_PROJECT_PATHS if os.path.isfile(path)),
+    MR_MC240N_PROJECT_PATHS[0],
+)
 
 AXIS_TRAVEL_MIN_MM = 0.0
 AXIS_TRAVEL_MAX_MM = 196.0
+MR_MC240N_PROJECT_COMMAND_UNITS_PER_MM = 1000.0
+POSITION_SOFT_LIMIT_POLL_MS = 50
+POSITION_SOFT_LIMIT_RESERVE_MM = 0.1
 USB_MOTION_SPEED_MIN_MM_MIN = 1
 USB_MOTION_SPEED_MAX_MM_MIN = 12_000
 MOTION_RAMP_MIN_MS = 0
@@ -335,6 +348,12 @@ class AspectRatioLogoLabel(QLabel):
 class ClampTestMachineApp(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.mr_project_config = None
+        self.mr_project_error = ""
+        try:
+            self.mr_project_config = load_mr_mc240n_project(MR_MC240N_PROJECT_PATH)
+        except (OSError, ValueError) as exc:
+            self.mr_project_error = str(exc)
         self.setWindowTitle("6-Axis Clamp Test Machine")
         if os.path.isfile(CTR_LOGO_PATH):
             self.setWindowIcon(QIcon(CTR_LOGO_PATH))
@@ -358,6 +377,8 @@ class ClampTestMachineApp(QMainWindow):
         self.position_jog_command_active = False
         self.position_jog_direction = None
         self.position_motion_may_be_active = False
+        self.position_home_established = False
+        self.position_home_command_pending = False
         self.position_controller_close_failed = False
         self.latest_live_position_mm = None
         self.latest_live_position_counts = None
@@ -390,7 +411,10 @@ class ClampTestMachineApp(QMainWindow):
         self.camera_timer.timeout.connect(self.camera_timer_step)
         self.camera_timer.setTimerType(Qt.PreciseTimer)
         self.position_motion_status_timer = QTimer(self)
-        self.position_motion_status_timer.setInterval(250)
+        self.position_motion_status_timer.setInterval(
+            POSITION_SOFT_LIMIT_POLL_MS
+        )
+        self.position_motion_status_timer.setTimerType(Qt.PreciseTimer)
         self.position_motion_status_timer.timeout.connect(
             self.poll_position_motion_status
         )
@@ -811,7 +835,12 @@ class ClampTestMachineApp(QMainWindow):
         self.mr_connection_combo.addItems(
             [MR_CONNECTION_USB_MAINTENANCE, MR_CONNECTION_PCIE_API]
         )
-        self.mr_connection_combo.setCurrentText(MR_CONNECTION_USB_MAINTENANCE)
+        project_connection = (
+            self.mr_project_config["connection"]
+            if self.mr_project_config is not None
+            else MR_CONNECTION_USB_MAINTENANCE
+        )
+        self.mr_connection_combo.setCurrentText(project_connection)
         self.mr_connection_combo.currentTextChanged.connect(
             self.on_position_connection_changed
         )
@@ -825,7 +854,16 @@ class ClampTestMachineApp(QMainWindow):
         connection_grid.addWidget(self.in_mr_dll_path, 1, 1)
 
         connection_grid.addWidget(QLabel("보드 ID:"), 2, 0)
-        self.in_mr_board_id = QLineEdit("0")
+        project_board_id = (
+            self.mr_project_config["board_id"]
+            if self.mr_project_config is not None
+            else 0
+        )
+        self.in_mr_board_id = QLineEdit(str(project_board_id))
+        if self.mr_project_config is not None:
+            self.in_mr_board_id.setToolTip(
+                f"Loaded from {self.mr_project_config['path']}"
+            )
         self.configure_int_input(self.in_mr_board_id, 0, 3)
         self.in_mr_board_id.editingFinished.connect(
             self.on_position_connection_settings_changed
@@ -834,7 +872,14 @@ class ClampTestMachineApp(QMainWindow):
 
         connection_grid.addWidget(QLabel("축 No:"), 3, 0)
         self.in_mr_axis_no = QComboBox()
-        self.in_mr_axis_no.addItems([str(axis) for axis in range(1, 7)])
+        project_axes = (
+            self.mr_project_config.get("control_axes", [])
+            if self.mr_project_config is not None
+            else []
+        )
+        self.in_mr_axis_no.addItems(
+            [str(axis) for axis in (project_axes or range(1, 7))]
+        )
         self.in_mr_axis_no.setToolTip(
             "HG-KR13 + MR-J4-10B-RJ six-axis setup. "
             "Amplifier rotary switch 0..5 maps to control axis 1..6."
@@ -865,6 +910,11 @@ class ClampTestMachineApp(QMainWindow):
             "sscSystemStart may wait at least 10 seconds while initializing SSCNET."
         )
         self.chk_mr_auto_start.setEnabled(False)
+        # A .pbp2 file describes the intended project, but it does not prove
+        # that the matching parameters have already been written to the board.
+        # Keep System Start explicit so an incomplete/incorrect axis map does
+        # not turn a monitoring connection into a startup error.
+        self.chk_mr_auto_start.setChecked(False)
         self.chk_mr_auto_start.toggled.connect(
             self.on_position_connection_settings_changed
         )
@@ -873,11 +923,19 @@ class ClampTestMachineApp(QMainWindow):
         self.chk_mr_motion_arm = QCheckBox("모션 명령 Arm")
         self.chk_mr_motion_arm.toggled.connect(self.on_position_motion_arm_toggled)
 
-        self.btn_mr_connect = QPushButton("Connect USB Controller")
+        self.btn_mr_connect = QPushButton(
+            "Connect USB Controller"
+            if project_connection == MR_CONNECTION_USB_MAINTENANCE
+            else "Connect PCIe Board"
+        )
         self.btn_mr_connect.setMinimumHeight(38)
         self.btn_mr_connect.clicked.connect(self.test_position_board_connection)
         connection_grid.addWidget(self.btn_mr_connect, 6, 0)
-        self.btn_mr_system_start = QPushButton("USB System Start")
+        self.btn_mr_system_start = QPushButton(
+            "USB System Start"
+            if project_connection == MR_CONNECTION_USB_MAINTENANCE
+            else "Apply CTR Project + Start"
+        )
         self.btn_mr_system_start.setMinimumHeight(38)
         self.btn_mr_system_start.clicked.connect(self.start_position_usb_system)
         connection_grid.addWidget(self.btn_mr_system_start, 6, 1)
@@ -964,7 +1022,10 @@ class ClampTestMachineApp(QMainWindow):
 
         motion_layout = QHBoxLayout()
         motion_layout.setSpacing(4)
-        self.btn_mr_home = QPushButton("홈")
+        self.btn_mr_home = QPushButton("홈(현재=0)")
+        self.btn_mr_home.setToolTip(
+            "현재 물리 위치를 0 mm로 지정합니다. 반드시 실제 하한 위치에서 실행하세요."
+        )
         self.btn_mr_home.clicked.connect(self.start_position_home)
         self.btn_mr_move_relative = QPushButton("이동")
         self.btn_mr_move_relative.clicked.connect(self.start_position_relative_move)
@@ -991,8 +1052,15 @@ class ClampTestMachineApp(QMainWindow):
         stop_layout = QHBoxLayout()
         stop_layout.setSpacing(4)
         self.btn_mr_stop = QPushButton("정지")
+        self.btn_mr_stop.setToolTip(
+            "Mode-specific deceleration stop; escalates to SEMI software "
+            "forced stop if stopping cannot be confirmed"
+        )
         self.btn_mr_stop.clicked.connect(lambda: self.stop_position_motion(False))
         self.btn_mr_rapid_stop = QPushButton("긴급정지")
+        self.btn_mr_rapid_stop.setToolTip(
+            "All-axis software forced stop (SEMI=ON)"
+        )
         self.btn_mr_rapid_stop.clicked.connect(self.stop_all_position_axes)
         self.btn_mr_rapid_stop.setStyleSheet(
             "background-color: #C62828; color: white; font-weight: bold;"
@@ -1050,6 +1118,16 @@ class ClampTestMachineApp(QMainWindow):
         mr_status = "MR-MC240N: Windows + matching Mitsubishi API DLL required"
         if os.name != "nt":
             mr_status = f"MR-MC240N: {MR_MC240N_WINDOWS_ONLY_MESSAGE}"
+        elif self.mr_project_config is not None:
+            mr_status = (
+                "MR-MC240N: PB Test project metadata loaded "
+                f"({os.path.basename(self.mr_project_config['path'])}, "
+                f"tool preference={self.mr_project_config['tool_mode_name']}), "
+                f"{self.mr_project_config['connection']}, board "
+                f"{self.mr_project_config['board_id']}"
+            )
+        elif self.mr_project_error:
+            mr_status = f"MR-MC240N: project load failed - {self.mr_project_error}"
 
         log_group = QGroupBox("System Log")
         log_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -2901,9 +2979,11 @@ class ClampTestMachineApp(QMainWindow):
             if self.chk_mr_motion_arm.isChecked():
                 self.chk_mr_motion_arm.setChecked(False)
             self.btn_mr_connect.setText("Connect USB Controller")
+            self.btn_mr_system_start.setText("USB System Start")
             self.chk_mr_auto_start.setEnabled(False)
         else:
             self.btn_mr_connect.setText("Connect PCIe Board")
+            self.btn_mr_system_start.setText("Apply CTR Project + Start")
             self.chk_mr_auto_start.setEnabled(True)
         if self.is_position_monitor_enabled():
             self.on_position_monitor_toggled(True)
@@ -3064,8 +3144,17 @@ class ClampTestMachineApp(QMainWindow):
         )
         self.btn_mr_system_start.setEnabled(
             enabled
-            and self.is_position_usb_mode()
             and not configuration_locked
+            and not armed
+            and (
+                self.is_position_usb_mode()
+                or (
+                    self.mr_project_config is not None
+                    and os.path.isfile(
+                        self.mr_project_config.get("parameter_file", "")
+                    )
+                )
+            )
         )
         self.btn_mr_apply_six_axis.setEnabled(
             enabled
@@ -3171,13 +3260,53 @@ class ClampTestMachineApp(QMainWindow):
             )
 
     def start_position_usb_system(self):
-        if not self.is_position_usb_mode():
+        usb_mode = self.is_position_usb_mode()
+        if not usb_mode and self.mr_project_config is None:
+            self.handle_position_command_error(
+                "Apply project",
+                RuntimeError("No PB Test project is loaded."),
+            )
             return
+        if usb_mode:
+            title = "USB System Start"
+            prompt = (
+                "Send System Start using the parameters currently stored in "
+                "the MR-MC240N? No Servo/JOG command will be sent."
+            )
+        else:
+            parameter_file = self.mr_project_config["parameter_file"]
+            title = "Apply CTR Project + Start"
+            try:
+                counts_per_mm = self.get_position_monitor_config()[
+                    "counts_per_mm"
+                ]
+            except Exception as exc:
+                self.handle_position_command_error(title, exc)
+                return
+            if abs(
+                counts_per_mm - MR_MC240N_PROJECT_COMMAND_UNITS_PER_MM
+            ) > 1e-9:
+                self.handle_position_command_error(
+                    title,
+                    ValueError(
+                        "CTR 프로젝트의 0~196 mm 보드 소프트 리미트는 "
+                        "Command Units / mm = 1000 설정 전용입니다."
+                    ),
+                )
+                return
+            prompt = (
+                "This stops all axes, reboots the MR-MC240N channel, resets "
+                "its RAM parameters, writes the complete project parameter "
+                f"file ({os.path.basename(parameter_file)}), and performs "
+                "System Start. Axis 1 is configured for a 0~196 mm software "
+                "limit and data-set home. After startup, place the axis at "
+                "the physical 0 mm endpoint and press '홈(현재=0)'. No "
+                "Servo/JOG command will be sent. Continue?"
+            )
         answer = QMessageBox.question(
             self,
-            "USB System Start",
-            "MR-MC240N의 현재 보드 파라미터로 System Start 명령을 보냅니다.\n"
-            "Servo/JOG 명령은 보내지 않습니다. 축 구성과 비상정지를 확인했습니까?",
+            title,
+            prompt,
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -3185,14 +3314,40 @@ class ClampTestMachineApp(QMainWindow):
             return
         try:
             controller = self.get_position_controller(require_armed=False)
-            if not isinstance(controller, MrMc240nUsbController):
-                raise RuntimeError("USB direct controller가 선택되지 않았습니다.")
-            status_code = controller.start_system()
-            self.set_mr_status_text(
-                f"MR-MC240N: USB System Start sent, status 0x{status_code:04X}"
-            )
+            if usb_mode:
+                if not isinstance(controller, MrMc240nUsbController):
+                    raise RuntimeError("USB direct controller is not selected.")
+                status_code = controller.start_system()
+                self.set_mr_status_text(
+                    "MR-MC240N: USB System Start sent, "
+                    f"status 0x{status_code:04X}"
+                )
+            else:
+                if not isinstance(controller, MrMc240nPositionController):
+                    raise RuntimeError("PCIe API controller is not selected.")
+                result = controller.apply_parameter_file_and_start(
+                    self.mr_project_config["parameter_file"]
+                )
+                self.position_home_established = False
+                self.position_home_command_pending = False
+                self.position_zero_offset_mm = 0.0
+                self.set_mr_status_text(
+                    "MR-MC240N: CTR project applied and System Start "
+                    f"completed ({result['parameter_count']} parameters, "
+                    f"status 0x{result['system_status']:04X}); move to physical "
+                    "0 mm and press 홈(현재=0)"
+                )
+                self.append_system_log(
+                    "CTR project parameters applied to board RAM; System "
+                    "Start completed with EMI/EM2 test configuration and "
+                    "axis 1 software limits 0~196000 command units. The board "
+                    "limit becomes active after 홈(현재=0) completes "
+                    f"({result['parameter_count']} parameters)",
+                    "MR-MC240N",
+                )
+                self.refresh_position_axis_status()
         except Exception as exc:
-            self.handle_position_command_error("USB System Start", exc)
+            self.handle_position_command_error(title, exc)
 
     def apply_position_six_axis_preset(self):
         if not self.is_position_usb_mode():
@@ -3695,6 +3850,8 @@ class ClampTestMachineApp(QMainWindow):
         self.position_jog_command_active = False
         self.position_jog_direction = None
         self.position_motion_may_be_active = False
+        self.position_home_established = False
+        self.position_home_command_pending = False
         self.position_controller_close_failed = False
         self.position_monitor = None
         self.stop_position_motion_status_monitor()
@@ -3728,6 +3885,34 @@ class ClampTestMachineApp(QMainWindow):
             if opened_here and not self.is_test_running:
                 self.close_position_monitor()
 
+    @staticmethod
+    def machine_position_mm_from_counts(raw_counts, counts_per_mm):
+        counts_per_mm = float(counts_per_mm)
+        if counts_per_mm <= 0:
+            raise ValueError("Command Units / mm must be greater than zero.")
+        return int(raw_counts) / counts_per_mm
+
+    def get_jog_soft_limit_stop_margin_mm(self, motion_config):
+        return calculate_soft_limit_stop_margin_mm(
+            motion_config["speed"],
+            motion_config["deceleration_ms"],
+            POSITION_SOFT_LIMIT_POLL_MS,
+            POSITION_SOFT_LIMIT_RESERVE_MM,
+        )
+
+    def require_position_home_established(self, controller):
+        if self.position_home_established:
+            return
+        axis_status = controller.read_axis_status()
+        if axis_status.get("home_complete"):
+            self.position_home_established = True
+            self.position_zero_offset_mm = 0.0
+            return
+        raise RuntimeError(
+            "0~196 mm 보드 소프트 리미트는 원점 설정 후 활성화됩니다. "
+            "축을 실제 0 mm 위치에 둔 다음 '홈(현재=0)'을 먼저 누르세요."
+        )
+
     def get_position_controller(self, require_armed=True):
         if not self.is_position_monitor_enabled():
             raise RuntimeError("MR-MC240N position board를 먼저 활성화해주세요.")
@@ -3752,14 +3937,16 @@ class ClampTestMachineApp(QMainWindow):
         self.set_mr_status_text(f"MR-MC240N: {message}")
         QMessageBox.critical(self, "MR-MC240N Control Error", message)
 
-    def begin_position_motion_status_monitor(self):
+    def begin_position_motion_status_monitor(self, timeout_seconds=300.0):
         if (
             self.position_monitor is None
             or not self.position_monitor._motion_command_may_be_active
         ):
             self.stop_position_motion_status_monitor()
             return
-        self.position_motion_status_deadline = time.monotonic() + 300.0
+        self.position_motion_status_deadline = (
+            time.monotonic() + max(1.0, float(timeout_seconds))
+        )
         self.position_motion_status_failures = 0
         self.position_motion_status_timer.start()
 
@@ -3779,54 +3966,127 @@ class ClampTestMachineApp(QMainWindow):
             self.update_position_control_state()
             return
         if time.monotonic() >= self.position_motion_status_deadline:
-            self.stop_position_motion_status_monitor()
-            self.set_mr_status_text(
-                "MR-MC240N: motion status polling timed out; motion remains "
-                "locked until Stop/Rapid Stop is confirmed"
+            stop_confirmed = self.stop_all_position_axes(
+                reason="soft-limit monitor timeout",
+                report_error=False,
             )
-            self.update_position_control_state()
+            QMessageBox.critical(
+                self,
+                "Soft Limit Monitor Timeout",
+                "소프트 리미트 감시 시간이 초과되어 6축 전체 정지를 "
+                "요청했습니다."
+                + (
+                    ""
+                    if stop_confirmed
+                    else " 하드와이어 비상정지를 즉시 작동하세요."
+                ),
+            )
             return
         try:
             axis_status = controller.read_axis_status()
         except Exception as exc:
             self.position_motion_status_failures += 1
             if self.position_motion_status_failures >= 3:
-                self.stop_position_motion_status_monitor()
-                self.set_mr_status_text(
-                    "MR-MC240N: motion status read failed three times; motion "
-                    f"remains locked - {exc}"
+                stop_confirmed = self.stop_all_position_axes(
+                    reason="soft-limit position monitoring lost",
+                    report_error=False,
                 )
                 self.append_system_log(
-                    f"Motion status monitor stopped after read failures: {exc}",
+                    "Soft-limit position monitoring failed three times; "
+                    f"stop requested: {exc}",
                     "MR-MC240N",
+                    dedupe_seconds=0,
+                )
+                QMessageBox.critical(
+                    self,
+                    "Soft Limit Monitor Error",
+                    "축 위치를 3회 연속 읽지 못해 6축 전체 정지를 "
+                    "요청했습니다."
+                    + (
+                        ""
+                        if stop_confirmed
+                        else " 하드와이어 비상정지를 즉시 작동하세요."
+                    ),
                 )
             return
 
         self.position_motion_status_failures = 0
+        try:
+            counts_per_mm = self.get_position_monitor_config()["counts_per_mm"]
+            machine_position_mm = self.machine_position_mm_from_counts(
+                axis_status["position"],
+                counts_per_mm,
+            )
+        except Exception as exc:
+            stop_confirmed = self.stop_all_position_axes(
+                reason="soft-limit position conversion failed",
+                report_error=False,
+            )
+            QMessageBox.critical(
+                self,
+                "Soft Limit Monitor Error",
+                f"축 위치 소프트 리미트 계산에 실패했습니다: {exc}\n\n"
+                + (
+                    "6축 전체 정지를 요청했습니다."
+                    if stop_confirmed
+                    else "하드와이어 비상정지를 즉시 작동하세요."
+                ),
+            )
+            return
+
+        if not (
+            AXIS_TRAVEL_MIN_MM
+            <= machine_position_mm
+            <= AXIS_TRAVEL_MAX_MM
+        ):
+            stop_confirmed = self.stop_all_position_axes(
+                reason=(
+                    f"machine position {machine_position_mm:.3f} mm outside "
+                    f"{AXIS_TRAVEL_MIN_MM:g}~{AXIS_TRAVEL_MAX_MM:g} mm"
+                ),
+                report_error=False,
+            )
+            QMessageBox.critical(
+                self,
+                "Axis Soft Limit Exceeded",
+                f"축 위치 {machine_position_mm:.3f} mm가 소프트 리미트 "
+                f"{AXIS_TRAVEL_MIN_MM:g}~{AXIS_TRAVEL_MAX_MM:g} mm를 "
+                "벗어나 6축 전체 정지를 요청했습니다."
+                + (
+                    ""
+                    if stop_confirmed
+                    else " 하드와이어 비상정지를 즉시 작동하세요."
+                ),
+            )
+            return
+
+        if self.position_home_command_pending and axis_status["home_complete"]:
+            self.position_home_command_pending = False
+            self.position_home_established = True
+            self.position_zero_offset_mm = 0.0
+            self.append_system_log(
+                "Axis 1 data-set home completed at 0 mm; board software "
+                "limits 0~196 mm are now active",
+                "MR-MC240N",
+                dedupe_seconds=0,
+            )
+
         if self.position_jog_command_active:
-            try:
-                counts_per_mm = self.get_position_monitor_config()[
-                    "counts_per_mm"
-                ]
-                position_mm = (
-                    int(axis_status["position"]) / counts_per_mm
-                ) - self.position_zero_offset_mm
-            except Exception as exc:
-                self.set_mr_status_text(
-                    f"MR-MC240N: JOG soft-limit position check failed - {exc}"
-                )
-                position_mm = None
+            motion_config = self.get_position_motion_config()
+            stop_margin_mm = self.get_jog_soft_limit_stop_margin_mm(
+                motion_config
+            )
             reached_minimum = (
-                position_mm is not None
-                and self.position_jog_direction
+                self.position_jog_direction
                 == MrMc240nPositionController.SSC_DIR_MINUS
-                and position_mm <= AXIS_TRAVEL_MIN_MM
+                and machine_position_mm
+                <= AXIS_TRAVEL_MIN_MM + stop_margin_mm
             )
             reached_maximum = (
-                position_mm is not None
-                and self.position_jog_direction
+                self.position_jog_direction
                 == MrMc240nPositionController.SSC_DIR_PLUS
-                and position_mm >= AXIS_TRAVEL_MAX_MM
+                and machine_position_mm
+                >= AXIS_TRAVEL_MAX_MM - stop_margin_mm
             )
             if reached_minimum or reached_maximum:
                 limit_text = (
@@ -3834,14 +4094,23 @@ class ClampTestMachineApp(QMainWindow):
                     if reached_minimum
                     else f"{AXIS_TRAVEL_MAX_MM:g} mm"
                 )
-                self.stop_all_position_axes(
-                    reason=f"JOG soft limit {limit_text}"
+                stop_confirmed = self.stop_position_motion(False)
+                message_box = (
+                    QMessageBox.warning
+                    if stop_confirmed
+                    else QMessageBox.critical
                 )
-                QMessageBox.critical(
+                message_box(
                     self,
                     "JOG Soft Limit",
-                    f"축 위치가 소프트 리미트 {limit_text}에 도달해 "
-                    "6축 전체를 긴급정지했습니다.",
+                    f"축 위치 {machine_position_mm:.3f} mm에서 {limit_text} "
+                    f"경계 전 정지거리 {stop_margin_mm:.3f} mm에 도달해 "
+                    "JOG 감속정지를 요청했습니다."
+                    + (
+                        ""
+                        if stop_confirmed
+                        else " 하드와이어 비상정지를 즉시 작동하세요."
+                    ),
                 )
                 return
         if axis_status["servo_alarm"] or axis_status["operation_alarm"]:
@@ -3870,22 +4139,40 @@ class ClampTestMachineApp(QMainWindow):
             )
             self.refresh_position_axis_status()
             if enabled:
-                QTimer.singleShot(250, self.refresh_position_axis_status)
+                # Mitsubishi's samples wait up to 10 seconds for RDY after SON.
+                # Poll without blocking the UI so delayed amplifier readiness is
+                # reflected instead of being reported as an immediate failure.
+                for delay_ms in (500, 2_000, 5_000, 10_000):
+                    QTimer.singleShot(delay_ms, self.refresh_position_axis_status)
         except Exception as exc:
             self.handle_position_command_error(action, exc)
 
     def start_position_home(self):
+        answer = QMessageBox.question(
+            self,
+            "Set Current Position to 0 mm",
+            "축 1은 리미트 스위치가 없는 데이터셋 원점 방식입니다.\n\n"
+            "현재 축이 실제 기계 하한 0 mm 위치에 있습니까?\n"
+            "계속하면 현재 위치를 0 mm로 지정하고 보드의 0~196 mm "
+            "소프트 리미트를 활성화합니다.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
         controller = None
         try:
             controller = self.get_position_controller(require_armed=True)
             controller.start_home_return()
+            self.position_home_command_pending = True
             self.position_motion_may_be_active = (
                 controller._motion_command_may_be_active
             )
             self.begin_position_motion_status_monitor()
             self.update_position_control_state()
             self.set_mr_status_text(
-                f"MR-MC240N: home return started on axis {controller.axis_number}"
+                f"MR-MC240N: setting axis {controller.axis_number} current "
+                "position to 0 mm"
             )
         except Exception as exc:
             if controller is not None:
@@ -3894,27 +4181,36 @@ class ClampTestMachineApp(QMainWindow):
                 )
                 self.begin_position_motion_status_monitor()
                 self.update_position_control_state()
-            self.handle_position_command_error("Home return", exc)
+            if not self.position_motion_may_be_active:
+                self.position_home_command_pending = False
+            self.handle_position_command_error("Set current position to 0 mm", exc)
 
     def start_position_relative_move(self):
         controller = None
         try:
             controller = self.get_position_controller(require_armed=True)
+            self.require_position_home_established(controller)
             board_config = self.get_position_monitor_config()
             motion_config = self.get_position_motion_config()
-            current_position_mm, _ = self.read_position_feedback()
-            if current_position_mm is None:
+            current_position_mm, current_position_counts = (
+                self.read_position_feedback()
+            )
+            if current_position_counts is None:
                 raise RuntimeError("현재 축 위치를 읽지 못했습니다.")
-            target_position_mm = (
-                current_position_mm + motion_config["distance_mm"]
+            machine_position_mm = self.machine_position_mm_from_counts(
+                current_position_counts,
+                board_config["counts_per_mm"],
+            )
+            target_machine_position_mm = (
+                machine_position_mm + motion_config["distance_mm"]
             )
             if not (
                 AXIS_TRAVEL_MIN_MM
-                <= target_position_mm
+                <= target_machine_position_mm
                 <= AXIS_TRAVEL_MAX_MM
             ):
                 raise ValueError(
-                    f"요청 목표 위치 {target_position_mm:.3f} mm가 "
+                    f"요청 목표 기계 위치 {target_machine_position_mm:.3f} mm가 "
                     f"소프트 리미트 {AXIS_TRAVEL_MIN_MM:g}~"
                     f"{AXIS_TRAVEL_MAX_MM:g} mm를 벗어납니다."
                 )
@@ -3934,7 +4230,23 @@ class ClampTestMachineApp(QMainWindow):
             self.position_motion_may_be_active = (
                 controller._motion_command_may_be_active
             )
-            self.begin_position_motion_status_monitor()
+            expected_seconds = (
+                abs(motion_config["distance_mm"])
+                / motion_config["speed"]
+                * 60.0
+            )
+            self.begin_position_motion_status_monitor(
+                max(
+                    300.0,
+                    expected_seconds * 2.0
+                    + (
+                        motion_config["acceleration_ms"]
+                        + motion_config["deceleration_ms"]
+                    )
+                    / 1000.0
+                    + 5.0,
+                )
+            )
             self.update_position_control_state()
             self.set_mr_status_text(
                 "MR-MC240N: relative move started "
@@ -3954,26 +4266,39 @@ class ClampTestMachineApp(QMainWindow):
         controller = None
         try:
             controller = self.get_position_controller(require_armed=True)
+            self.require_position_home_established(controller)
             motion_config = self.get_position_motion_config()
             if hasattr(controller, "read_feedback_position_counts"):
-                current_position_mm, _ = self.read_position_feedback()
-                if current_position_mm is None:
+                board_config = self.get_position_monitor_config()
+                _, current_position_counts = self.read_position_feedback()
+                if current_position_counts is None:
                     raise RuntimeError("현재 축 위치를 읽지 못했습니다.")
+                machine_position_mm = self.machine_position_mm_from_counts(
+                    current_position_counts,
+                    board_config["counts_per_mm"],
+                )
+                stop_margin_mm = self.get_jog_soft_limit_stop_margin_mm(
+                    motion_config
+                )
                 if (
                     direction == MrMc240nPositionController.SSC_DIR_MINUS
-                    and current_position_mm <= AXIS_TRAVEL_MIN_MM
+                    and machine_position_mm
+                    <= AXIS_TRAVEL_MIN_MM + stop_margin_mm
                 ):
                     raise ValueError(
-                        f"현재 위치가 최소 소프트 리미트 "
-                        f"{AXIS_TRAVEL_MIN_MM:g} mm입니다."
+                        f"현재 기계 위치 {machine_position_mm:.3f} mm에서 "
+                        f"하한 정지 여유 {stop_margin_mm:.3f} mm를 확보할 수 "
+                        "없습니다. 속도/감속시간을 낮추거나 반대 방향으로 이동하세요."
                     )
                 if (
                     direction == MrMc240nPositionController.SSC_DIR_PLUS
-                    and current_position_mm >= AXIS_TRAVEL_MAX_MM
+                    and machine_position_mm
+                    >= AXIS_TRAVEL_MAX_MM - stop_margin_mm
                 ):
                     raise ValueError(
-                        f"현재 위치가 최대 소프트 리미트 "
-                        f"{AXIS_TRAVEL_MAX_MM:g} mm입니다."
+                        f"현재 기계 위치 {machine_position_mm:.3f} mm에서 "
+                        f"상한 정지 여유 {stop_margin_mm:.3f} mm를 확보할 수 "
+                        "없습니다. 속도/감속시간을 낮추거나 반대 방향으로 이동하세요."
                     )
             controller.start_jog(
                 direction,
@@ -4057,13 +4382,27 @@ class ClampTestMachineApp(QMainWindow):
         )
         try:
             controller = self.get_position_controller(require_armed=False)
-            controller.stop(rapid=rapid)
+            stop_result = controller.stop(rapid=rapid)
             self.position_jog_command_active = False
             self.position_jog_direction = None
             self.position_motion_may_be_active = False
             self.stop_position_motion_status_monitor()
             self.update_position_control_state()
-            self.set_mr_status_text(f"MR-MC240N: {action} completed")
+            stop_mode = (
+                stop_result.get("mode", action.lower())
+                if isinstance(stop_result, dict)
+                else action.lower()
+            )
+            self.set_mr_status_text(
+                f"MR-MC240N: {action} completed via {stop_mode}"
+            )
+            if isinstance(stop_result, dict) and stop_result.get("escalated"):
+                self.append_system_log(
+                    f"{action} escalated to SEMI software forced stop: "
+                    f"{stop_result.get('primary_error', 'normal stop unconfirmed')}",
+                    "MR-MC240N",
+                    dedupe_seconds=0,
+                )
             if automatic_test_active:
                 self.live_motion_cycle_active = False
                 self.stop_test(completed=False)
@@ -4098,7 +4437,7 @@ class ClampTestMachineApp(QMainWindow):
         )
         try:
             controller = self.get_position_controller(require_armed=False)
-            controller.stop_all_axes(
+            stop_result = controller.stop_all_axes(
                 axis_numbers=range(1, 7),
                 rapid=True,
                 timeout_ms=3000,
@@ -4112,8 +4451,13 @@ class ClampTestMachineApp(QMainWindow):
                 self.stop_test(completed=False)
             self.update_position_control_state()
             detail = f" ({reason})" if reason else ""
+            stop_mode = (
+                stop_result.get("mode", "all-axis rapid stop")
+                if isinstance(stop_result, dict)
+                else "all-axis rapid stop"
+            )
             self.set_mr_status_text(
-                f"MR-MC240N: all-axis Rapid Stop completed{detail}"
+                f"MR-MC240N: {stop_mode} completed{detail}"
             )
             return True
         except Exception as exc:
@@ -4145,9 +4489,18 @@ class ClampTestMachineApp(QMainWindow):
             selected_axis = config["axis_number"]
             selected_summary = None
             waiting_for_sscnet = False
+            axis_unmounted = False
+            system_bits = None
             if isinstance(controller, MrMc240nUsbController):
                 controller.check_connection()
                 waiting_for_sscnet = controller.system_status_code == 0x0009
+            else:
+                system_status = controller.get_system_status_code()
+                system_bits = controller.read_system_status()
+                axis_unmounted = (
+                    system_status
+                    == MrMc240nPositionController.SSC_STS_CODE_AXIS_UNMOUNTED
+                )
 
             for axis, label in enumerate(self.mr_axis_status_labels, start=1):
                 try:
@@ -4157,7 +4510,9 @@ class ClampTestMachineApp(QMainWindow):
                         raw_counts / config["counts_per_mm"]
                         - self.position_zero_offset_mm
                     )
-                    if waiting_for_sscnet:
+                    if axis_unmounted:
+                        short_state = "AXIS UNMOUNTED"
+                    elif waiting_for_sscnet:
                         short_state = "WAIT SSCNET"
                     elif (
                         axis_status.get("status0") == 0
@@ -4181,6 +4536,9 @@ class ClampTestMachineApp(QMainWindow):
                     elif short_state == "WAIT SSCNET":
                         background = "#FFF8E1"
                         border_color = "#F9A825"
+                    elif short_state == "AXIS UNMOUNTED":
+                        background = "#FFF3E0"
+                        border_color = "#EF6C00"
                     label.setStyleSheet(
                         f"QLabel {{ background: {background}; "
                         f"border: 2px solid {border_color}; "
@@ -4189,6 +4547,7 @@ class ClampTestMachineApp(QMainWindow):
                     )
                     display_state = {
                         "WAIT SSCNET": "WAIT",
+                        "AXIS UNMOUNTED": "UNMOUNTED",
                         "UNCONFIGURED": "미설정",
                         "RUNNING": "RUN",
                         "NOT READY": "NOT READY",
@@ -4202,6 +4561,9 @@ class ClampTestMachineApp(QMainWindow):
                     )
 
                     if axis == selected_axis:
+                        if axis_status.get("home_complete"):
+                            self.position_home_established = True
+                            self.position_zero_offset_mm = 0.0
                         if (
                             not axis_status["operating"]
                             and axis_status["operation_complete"]
@@ -4216,6 +4578,7 @@ class ClampTestMachineApp(QMainWindow):
                             "RUNNING": "axis is operating",
                             "ALARM": "servo/operation alarm",
                             "WAIT SSCNET": "waiting for SSCNET amplifier response",
+                            "AXIS UNMOUNTED": "configured/connected axes mismatch (0xE400)",
                             "UNCONFIGURED": "axis not mounted/configured",
                             "NOT READY": "servo not ready",
                         }.get(short_state, short_state.lower())
@@ -4223,13 +4586,20 @@ class ClampTestMachineApp(QMainWindow):
                             text
                             for key, text in [
                                 ("servo_ready", "READY"),
+                                ("servo_on", "SERVO-ON"),
                                 ("operating", "RUNNING"),
                                 ("in_position", "IN-POS"),
                                 ("home_complete", "HOME"),
                                 ("servo_alarm", "SERVO-ALARM"),
                                 ("operation_alarm", "OP-ALARM"),
+                                ("servo_warning", "SERVO-WARNING"),
+                                ("absolute_encoder_error", "ABS-ENCODER"),
+                                ("incremental_feed_mode", "INC-FEED"),
+                                ("home_reset_mode", "HOME-RESET"),
+                                ("interlock_stop", "INTERLOCK-STOP"),
+                                ("startup_accepted", "START-ACCEPTED"),
                             ]
-                            if axis_status[key]
+                            if axis_status.get(key)
                         ]
                         state_text = (
                             ", ".join(state_names) if state_names else "NOT READY"
@@ -4241,6 +4611,25 @@ class ClampTestMachineApp(QMainWindow):
                             )
                         elif short_state == "UNCONFIGURED":
                             state_text = "AXIS NOT MOUNTED / CONFIGURED"
+                        elif short_state == "AXIS UNMOUNTED":
+                            state_text = (
+                                "AXIS UNMOUNTED (0xE400) - run PB Test System "
+                                "Diagnosis > Search the axes; match project axes, "
+                                "amplifier switches, power, and SSCNET wiring"
+                            )
+                        elif short_state == "NOT READY":
+                            state_text = "NOT READY - " + ", ".join(
+                                MrMc240nPositionController.axis_not_ready_reasons(
+                                    axis_status, system_bits
+                                )
+                            )
+                        if system_bits is not None:
+                            system_diagnostics = (
+                                f"EMIO={'ON' if system_bits['forced_stop_active'] else 'OFF'}, "
+                                f"EMID={'ON' if system_bits['external_forced_stop_disabled'] else 'OFF'}, "
+                                f"TSTO={'ON' if system_bits['test_mode_active'] else 'OFF'}"
+                            )
+                            state_text = f"{state_text}; {system_diagnostics}"
                         selected_summary = (
                             f"MR-MC240N axis {axis}: {state_text}, "
                             f"{position_mm:.4f} mm ({raw_counts} cmd)"
@@ -4394,8 +4783,22 @@ class ClampTestMachineApp(QMainWindow):
             raise RuntimeError(
                 "선택 축이 Servo Ready 상태가 아닙니다. Servo ON 후 다시 시작해주세요."
             )
+        self.require_position_home_established(controller)
 
         raw_counts = int(axis_status["position"])
+        machine_position_mm = self.machine_position_mm_from_counts(
+            raw_counts,
+            motion_config["counts_per_mm"],
+        )
+        if not (
+            AXIS_TRAVEL_MIN_MM
+            <= machine_position_mm
+            <= AXIS_TRAVEL_MAX_MM
+        ):
+            raise RuntimeError(
+                f"현재 기계 위치 {machine_position_mm:.3f} mm가 소프트 리미트 "
+                f"{AXIS_TRAVEL_MIN_MM:g}~{AXIS_TRAVEL_MAX_MM:g} mm를 벗어납니다."
+            )
         current_position_mm = (
             raw_counts / motion_config["counts_per_mm"]
         ) - self.position_zero_offset_mm
@@ -4418,10 +4821,13 @@ class ClampTestMachineApp(QMainWindow):
         if config is None:
             raise RuntimeError("자동 왕복 시험 설정이 없습니다.")
 
+        feedback_position_mm, raw_counts = self.read_position_feedback()
         if current_position_mm is None:
-            current_position_mm, _ = self.read_position_feedback()
+            current_position_mm = feedback_position_mm
         if current_position_mm is None:
             raise RuntimeError("MR-MC240N 현재 위치를 읽지 못했습니다.")
+        if raw_counts is None:
+            raise RuntimeError("MR-MC240N 현재 기계 좌표를 읽지 못했습니다.")
 
         distance_mm = target_mm - current_position_mm
         if abs(distance_mm) > (
@@ -4429,6 +4835,21 @@ class ClampTestMachineApp(QMainWindow):
         ):
             raise RuntimeError(
                 f"요청 이동량 {distance_mm:.3f} mm가 설정 Stroke 범위를 초과합니다."
+            )
+        machine_position_mm = self.machine_position_mm_from_counts(
+            raw_counts,
+            config["counts_per_mm"],
+        )
+        target_machine_position_mm = machine_position_mm + distance_mm
+        if not (
+            AXIS_TRAVEL_MIN_MM
+            <= target_machine_position_mm
+            <= AXIS_TRAVEL_MAX_MM
+        ):
+            raise RuntimeError(
+                f"자동 이동 목표 기계 위치 {target_machine_position_mm:.3f} mm가 "
+                f"소프트 리미트 {AXIS_TRAVEL_MIN_MM:g}~"
+                f"{AXIS_TRAVEL_MAX_MM:g} mm를 벗어납니다."
             )
 
         self.test_state = state
@@ -4457,6 +4878,18 @@ class ClampTestMachineApp(QMainWindow):
         finally:
             self.position_motion_may_be_active = (
                 controller._motion_command_may_be_active
+            )
+            self.begin_position_motion_status_monitor(
+                max(
+                    300.0,
+                    expected_seconds * 2.0
+                    + (
+                        config["acceleration_ms"]
+                        + config["deceleration_ms"]
+                    )
+                    / 1000.0
+                    + 5.0,
+                )
             )
             self.update_position_control_state()
         self.append_system_log(
@@ -4981,8 +5414,10 @@ class ClampTestMachineApp(QMainWindow):
         if self.is_position_pcie_enabled():
             try:
                 current_position_mm, current_position_counts = self.read_position_feedback()
-                self.position_zero_offset_mm += current_position_mm if current_position_mm is not None else 0.0
-                self.latest_live_position_mm = 0.0
+                # Axis zero is established only by the explicit data-set Home
+                # command so the display coordinate cannot drift away from the
+                # board's fixed 0~196 mm software-limit coordinate system.
+                self.latest_live_position_mm = current_position_mm
                 self.latest_live_position_counts = current_position_counts
                 if self.position_monitor is not None:
                     self.refresh_position_axis_status()
