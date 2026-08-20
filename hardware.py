@@ -42,6 +42,8 @@ MR_MC240N_REQUIRED_API_EXPORTS = (
     "sscHomeReturnStart",
     "sscDriveStop",
     "sscDriveRapidStop",
+    "sscOperationAlarmReset",
+    "sscServoAlarmReset",
 )
 
 
@@ -984,6 +986,8 @@ class MrMc240nPositionController:
             "sscDriveRapidStop",
             [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int],
         )
+        self._bind_api("sscOperationAlarmReset", [ctypes.c_int, ctypes.c_int, ctypes.c_int])
+        self._bind_api("sscServoAlarmReset", [ctypes.c_int, ctypes.c_int, ctypes.c_int])
 
     def _raise_api_error(self, action, status_code):
         detailed_error = None
@@ -1028,6 +1032,22 @@ class MrMc240nPositionController:
                 "emergency-stop and limit inputs, clear the cause, reset the "
                 "amplifier alarm, and confirm Servo Ready before retrying."
             )
+
+    def reset_axis_alarms(self):
+        """Reset operation and servo alarms for the selected stationary axis."""
+        axis_status = self.read_axis_status()
+        if axis_status["operating"] or self._motion_command_may_be_active:
+            raise RuntimeError(
+                f"Axis {self.axis_number} alarm reset was not sent because "
+                "motion may still be active. Stop the axis first."
+            )
+        self._call_api(
+            "sscOperationAlarmReset", self.board_id, self.channel, self.axis_number
+        )
+        self._call_api(
+            "sscServoAlarmReset", self.board_id, self.channel, self.axis_number
+        )
+        return self.read_axis_status()
 
     def _get_api(self, name):
         if self.library is None:

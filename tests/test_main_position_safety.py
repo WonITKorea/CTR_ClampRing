@@ -47,6 +47,19 @@ class PositionUiSafetyTests(unittest.TestCase):
         self.assertFalse(self.window.btn_mr_connect.isEnabled())
         self.assertTrue(self.window.btn_mr_rapid_stop.isEnabled())
 
+    def test_mr_settings_tab_is_first(self):
+        self.assertEqual(self.window.settings_tabs.tabText(0), "MR-MC240N 연결")
+
+    def test_motion_buttons_do_not_require_arm_checkbox(self):
+        self.window.chk_mr_motion_arm.setChecked(False)
+
+        self.window.update_position_control_state()
+
+        self.assertTrue(self.window.btn_mr_servo_on.isEnabled())
+        self.assertTrue(self.window.btn_mr_home.isEnabled())
+        self.assertTrue(self.window.btn_mr_jog_minus.isEnabled())
+        self.assertTrue(self.window.btn_mr_jog_plus.isEnabled())
+
     def test_controller_motion_latch_also_locks_configuration(self):
         monitor = SimpleNamespace(
             _motion_command_may_be_active=True,

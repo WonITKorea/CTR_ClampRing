@@ -66,6 +66,8 @@ def fake_vendor_library():
         sscHomeReturnStart=Mock(name="sscHomeReturnStart", return_value=0),
         sscDriveStop=Mock(name="sscDriveStop", return_value=0),
         sscDriveRapidStop=Mock(name="sscDriveRapidStop", return_value=0),
+        sscOperationAlarmReset=Mock(name="sscOperationAlarmReset", return_value=0),
+        sscServoAlarmReset=Mock(name="sscServoAlarmReset", return_value=0),
     )
 
 
@@ -155,6 +157,32 @@ class PositionBoardProjectTests(unittest.TestCase):
 
 
 class PositionControllerConstantTests(unittest.TestCase):
+    def test_alarm_reset_calls_vendor_operation_and_servo_reset(self):
+        library = fake_vendor_library()
+        controller = MrMc240nPositionController(board_id=2, axis_number=4)
+        controller.library = library
+        controller._is_open = True
+
+        status = controller.reset_axis_alarms()
+
+        library.sscOperationAlarmReset.assert_called_once_with(2, 1, 4)
+        library.sscServoAlarmReset.assert_called_once_with(2, 1, 4)
+        self.assertFalse(status["operation_alarm"])
+        self.assertFalse(status["servo_alarm"])
+
+    def test_alarm_reset_is_blocked_while_motion_may_be_active(self):
+        library = fake_vendor_library()
+        controller = MrMc240nPositionController(board_id=0, axis_number=1)
+        controller.library = library
+        controller._is_open = True
+        controller._motion_command_may_be_active = True
+
+        with self.assertRaisesRegex(RuntimeError, "motion may still be active"):
+            controller.reset_axis_alarms()
+
+        library.sscOperationAlarmReset.assert_not_called()
+        library.sscServoAlarmReset.assert_not_called()
+
     def test_host_soft_limit_margin_covers_deceleration_and_poll_latency(self):
         self.assertAlmostEqual(
             calculate_soft_limit_stop_margin_mm(100, 500, 50),

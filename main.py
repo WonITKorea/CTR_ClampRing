@@ -49,9 +49,11 @@ MR_MC240N_PROJECT_PATH = next(
 
 AXIS_TRAVEL_MIN_MM = 0.0
 AXIS_TRAVEL_MAX_MM = 196.0
+ENCODER_INITIAL_POSITION_COUNTS = -1
 MR_MC240N_PROJECT_COMMAND_UNITS_PER_MM = 1000.0
 POSITION_SOFT_LIMIT_POLL_MS = 50
 POSITION_SOFT_LIMIT_RESERVE_MM = 0.1
+POSITION_AXIS_LIVE_REFRESH_MS = 500
 USB_MOTION_SPEED_MIN_MM_MIN = 1
 USB_MOTION_SPEED_MAX_MM_MIN = 12_000
 MOTION_RAMP_MIN_MS = 0
@@ -417,6 +419,11 @@ class ClampTestMachineApp(QMainWindow):
         self.position_motion_status_timer.setTimerType(Qt.PreciseTimer)
         self.position_motion_status_timer.timeout.connect(
             self.poll_position_motion_status
+        )
+        self.position_axis_live_timer = QTimer(self)
+        self.position_axis_live_timer.setInterval(POSITION_AXIS_LIVE_REFRESH_MS)
+        self.position_axis_live_timer.timeout.connect(
+            lambda: self.refresh_position_axis_status(report_error=False)
         )
         self.position_motion_status_deadline = 0.0
         self.position_motion_status_failures = 0
@@ -921,7 +928,11 @@ class ClampTestMachineApp(QMainWindow):
         connection_grid.addWidget(self.chk_mr_auto_start, 5, 0, 1, 2)
 
         self.chk_mr_motion_arm = QCheckBox("모션 명령 Arm")
-        self.chk_mr_motion_arm.toggled.connect(self.on_position_motion_arm_toggled)
+        # Retained as an internal compatibility flag for saved/test state. Motion
+        # controls are now enabled automatically from the connection and safety
+        # state, so the operator no longer has to arm them separately.
+        self.chk_mr_motion_arm.setChecked(True)
+        self.chk_mr_motion_arm.setVisible(False)
 
         self.btn_mr_connect = QPushButton(
             "Connect USB Controller"
@@ -1072,6 +1083,13 @@ class ClampTestMachineApp(QMainWindow):
         self.btn_mr_refresh_status = QPushButton("축 상태 갱신")
         self.btn_mr_refresh_status.clicked.connect(self.refresh_position_axis_status)
         motion_grid.addWidget(self.btn_mr_refresh_status, 5, 1)
+        self.btn_mr_alarm_reset = QPushButton("Alarm Reset")
+        self.btn_mr_alarm_reset.setToolTip(
+            "Reset the selected axis operation alarm (OALM) and servo alarm "
+            "(SALM). Remove the alarm cause and stop motion first."
+        )
+        self.btn_mr_alarm_reset.clicked.connect(self.reset_position_axis_alarms)
+        motion_grid.addWidget(self.btn_mr_alarm_reset, 6, 0, 1, 2)
         for position_control_button in (
             self.btn_mr_servo_on,
             self.btn_mr_servo_off,
@@ -1082,6 +1100,7 @@ class ClampTestMachineApp(QMainWindow):
             self.btn_mr_stop,
             self.btn_mr_rapid_stop,
             self.btn_mr_refresh_status,
+            self.btn_mr_alarm_reset,
         ):
             position_control_button.setMinimumHeight(36)
         self.lbl_motion_ranges = QLabel(
@@ -1092,8 +1111,7 @@ class ClampTestMachineApp(QMainWindow):
         self.lbl_motion_ranges.setStyleSheet(
             "color: #555555; font-size: 11px;"
         )
-        motion_grid.addWidget(self.lbl_motion_ranges, 6, 0, 1, 2)
-        motion_grid.addWidget(self.chk_mr_motion_arm, 7, 0, 1, 2)
+        motion_grid.addWidget(self.lbl_motion_ranges, 7, 0, 1, 2)
         layout_position.addWidget(motion_group)
 
         overview_group = QGroupBox("6축 상태")
@@ -1397,6 +1415,10 @@ class ClampTestMachineApp(QMainWindow):
             "QTabBar::tab { min-height: 26px; }"
         )
         self.settings_tabs.addTab(
+            create_padded_settings_page(position_settings_page),
+            "MR-MC240N 연결",
+        )
+        self.settings_tabs.addTab(
             create_padded_settings_page(group_settings), "그래프"
         )
         self.settings_tabs.addTab(
@@ -1404,10 +1426,6 @@ class ClampTestMachineApp(QMainWindow):
         )
         self.settings_tabs.addTab(
             create_padded_settings_page(group_camera_settings), "Camera / Ring"
-        )
-        self.settings_tabs.addTab(
-            create_padded_settings_page(position_settings_page),
-            "MR-MC240N 연결",
         )
         settings_dialog_layout.addWidget(self.settings_tabs, 1)
         settings_buttons = QDialogButtonBox(QDialogButtonBox.Close)
@@ -2820,7 +2838,6 @@ class ClampTestMachineApp(QMainWindow):
     def is_position_control_armed(self):
         return (
             self.is_position_pcie_enabled()
-            and self.chk_mr_motion_arm.isChecked()
             and not self.position_controller_close_failed
         )
 
@@ -3115,7 +3132,6 @@ class ClampTestMachineApp(QMainWindow):
             self.btn_open_settings.setEnabled(not configuration_locked)
         armed = (
             control_enabled
-            and self.chk_mr_motion_arm.isChecked()
             and not self.position_controller_close_failed
         )
         self.chk_position_monitor.setEnabled(
@@ -3145,7 +3161,6 @@ class ClampTestMachineApp(QMainWindow):
         self.btn_mr_system_start.setEnabled(
             enabled
             and not configuration_locked
-            and not armed
             and (
                 self.is_position_usb_mode()
                 or (
@@ -3167,9 +3182,7 @@ class ClampTestMachineApp(QMainWindow):
             and not self.is_position_usb_mode()
             and not configuration_locked
         )
-        self.chk_mr_motion_arm.setEnabled(
-            control_enabled and not self.position_controller_close_failed
-        )
+        self.chk_mr_motion_arm.setEnabled(False)
         motion_buttons = [
             self.btn_mr_servo_on,
             self.btn_mr_servo_off,
@@ -3189,6 +3202,50 @@ class ClampTestMachineApp(QMainWindow):
         self.btn_mr_stop.setEnabled(control_enabled)
         self.btn_mr_rapid_stop.setEnabled(control_enabled)
         self.btn_mr_refresh_status.setEnabled(control_enabled)
+        self.btn_mr_alarm_reset.setEnabled(
+            control_enabled
+            and not self.is_position_usb_mode()
+            and not self.is_test_running
+            and not self.live_motion_cycle_active
+            and not motion_may_be_active
+            and not self.position_controller_close_failed
+        )
+
+    def reset_position_axis_alarms(self):
+        try:
+            controller = self.get_position_controller(require_armed=False)
+            if not isinstance(controller, MrMc240nPositionController):
+                raise RuntimeError(
+                    "Alarm Reset is available only with PCIe control (API)."
+                )
+            status = controller.reset_axis_alarms()
+            active = []
+            if status.get("operation_alarm"):
+                active.append("OALM")
+            if status.get("servo_alarm"):
+                active.append("SALM")
+            if active:
+                raise RuntimeError(
+                    f"Axis {controller.axis_number} alarm reset was sent, but "
+                    f"{', '.join(active)} remains active. Remove the alarm cause "
+                    "and retry."
+                )
+            self.set_mr_status_text(
+                f"MR-MC240N: axis {controller.axis_number} OALM/SALM reset completed"
+            )
+            self.append_system_log(
+                f"Axis {controller.axis_number} operation/servo alarm reset completed",
+                "MR-MC240N",
+                dedupe_seconds=0,
+            )
+            self.refresh_position_axis_status()
+            QMessageBox.information(
+                self,
+                "MR-MC240N Alarm Reset",
+                f"Axis {controller.axis_number} OALM/SALM reset completed.",
+            )
+        except Exception as exc:
+            self.handle_position_command_error("Alarm Reset", exc)
 
     def test_position_board_connection(self):
         """Open the configured board now so detection errors are immediately visible."""
@@ -3351,16 +3408,6 @@ class ClampTestMachineApp(QMainWindow):
 
     def apply_position_six_axis_preset(self):
         if not self.is_position_usb_mode():
-            return
-        if self.chk_mr_motion_arm.isChecked():
-            self.set_mr_status_text(
-                "MR-MC240N: six-axis preset blocked; disarm motion commands first"
-            )
-            QMessageBox.warning(
-                self,
-                "Disarm Motion First",
-                "6축 파라미터 적용 전에 모션 명령 Arm을 해제해주세요.",
-            )
             return
         answer = QMessageBox.question(
             self,
@@ -3772,6 +3819,7 @@ class ClampTestMachineApp(QMainWindow):
             raise
 
         self.position_monitor = monitor
+        self.position_axis_live_timer.start()
         self.position_axis_status_checked = False
         self.position_axis_ready = False
         self.position_readiness_detail = "axis status not checked"
@@ -3786,6 +3834,7 @@ class ClampTestMachineApp(QMainWindow):
 
     def close_position_monitor(self):
         if self.position_monitor is None:
+            self.position_axis_live_timer.stop()
             self.stop_position_motion_status_monitor()
             return True
         monitor = self.position_monitor
@@ -3854,6 +3903,7 @@ class ClampTestMachineApp(QMainWindow):
         self.position_home_command_pending = False
         self.position_controller_close_failed = False
         self.position_monitor = None
+        self.position_axis_live_timer.stop()
         self.stop_position_motion_status_monitor()
         self.position_axis_status_checked = False
         self.position_axis_ready = False
@@ -3923,7 +3973,10 @@ class ClampTestMachineApp(QMainWindow):
                 "정리 상태를 다시 확인하세요."
             )
         if require_armed and not self.is_position_control_armed():
-            raise RuntimeError("모션 명령 Arm을 먼저 활성화해주세요.")
+            raise RuntimeError(
+                "MR-MC240N PCIe 제어가 활성화되지 않았거나 안전 정리 상태가 "
+                "확인되지 않았습니다. 연결 상태를 확인하세요."
+            )
         # Always pass through the configuration fingerprint check. This
         # prevents a retained old controller from receiving commands after a
         # Board ID/DLL/axis setting changed.
@@ -4011,10 +4064,19 @@ class ClampTestMachineApp(QMainWindow):
             return
 
         self.position_motion_status_failures = 0
+        raw_position_counts = int(axis_status["position"])
+        if raw_position_counts == ENCODER_INITIAL_POSITION_COUNTS:
+            # The MR-MC240N can report -1 for a short time while its encoder
+            # feedback is initializing.  It is not a physical -1-count
+            # position and must not trip the host-side 0 mm soft limit.
+            self.set_mr_status_text(
+                f"MR-MC240N: axis {controller.axis_number} encoder initializing"
+            )
+            return
         try:
             counts_per_mm = self.get_position_monitor_config()["counts_per_mm"]
             machine_position_mm = self.machine_position_mm_from_counts(
-                axis_status["position"],
+                raw_position_counts,
                 counts_per_mm,
             )
         except Exception as exc:
@@ -4479,7 +4541,7 @@ class ClampTestMachineApp(QMainWindow):
                 )
             return False
 
-    def refresh_position_axis_status(self):
+    def refresh_position_axis_status(self, *_args, report_error=True):
         self.position_axis_status_checked = False
         self.position_axis_ready = False
         self.position_readiness_detail = "axis status not checked"
@@ -4506,6 +4568,9 @@ class ClampTestMachineApp(QMainWindow):
                 try:
                     axis_status = controller.read_axis_status(axis)
                     raw_counts = int(axis_status["position"])
+                    encoder_initializing = (
+                        raw_counts == ENCODER_INITIAL_POSITION_COUNTS
+                    )
                     position_mm = (
                         raw_counts / config["counts_per_mm"]
                         - self.position_zero_offset_mm
@@ -4514,6 +4579,8 @@ class ClampTestMachineApp(QMainWindow):
                         short_state = "AXIS UNMOUNTED"
                     elif waiting_for_sscnet:
                         short_state = "WAIT SSCNET"
+                    elif encoder_initializing:
+                        short_state = "INITIALIZING"
                     elif (
                         axis_status.get("status0") == 0
                         and axis_status.get("status1") == 0
@@ -4546,15 +4613,15 @@ class ClampTestMachineApp(QMainWindow):
                         "font-size: 9px; }"
                     )
                     display_state = {
+                        "INITIALIZING": "INIT",
                         "WAIT SSCNET": "WAIT",
                         "AXIS UNMOUNTED": "UNMOUNTED",
                         "UNCONFIGURED": "미설정",
                         "RUNNING": "RUN",
                         "NOT READY": "NOT READY",
                     }.get(short_state, short_state)
-                    label.setText(
-                        f"A{axis}\n{display_state}\n{position_mm:.2f} mm"
-                    )
+                    position_text = "encoder --" if encoder_initializing else f"{position_mm:.2f} mm"
+                    label.setText(f"A{axis}\n{display_state}\n{position_text}")
                     label.setToolTip(
                         f"Axis {axis}: {short_state}\n"
                         f"{position_mm:.4f} mm ({raw_counts} cmd)"
@@ -4577,6 +4644,7 @@ class ClampTestMachineApp(QMainWindow):
                             "READY": "axis ready",
                             "RUNNING": "axis is operating",
                             "ALARM": "servo/operation alarm",
+                            "INITIALIZING": "encoder feedback initializing",
                             "WAIT SSCNET": "waiting for SSCNET amplifier response",
                             "AXIS UNMOUNTED": "configured/connected axes mismatch (0xE400)",
                             "UNCONFIGURED": "axis not mounted/configured",
@@ -4609,6 +4677,8 @@ class ClampTestMachineApp(QMainWindow):
                                 "WAITING SSCNET RESPONSE - check controller→CN1A, "
                                 "CN1B→next CN1A, amplifier control power"
                             )
+                        elif short_state == "INITIALIZING":
+                            state_text = "ENCODER INITIALIZING (-1 sentinel)"
                         elif short_state == "UNCONFIGURED":
                             state_text = "AXIS NOT MOUNTED / CONFIGURED"
                         elif short_state == "AXIS UNMOUNTED":
@@ -4661,7 +4731,14 @@ class ClampTestMachineApp(QMainWindow):
             self.position_axis_ready = False
             self.position_readiness_detail = f"axis status refresh failed: {exc}"
             self.update_hardware_readiness_status()
-            self.handle_position_command_error("Axis status refresh", exc)
+            if report_error:
+                self.handle_position_command_error("Axis status refresh", exc)
+            else:
+                self.append_system_log(
+                    f"Live axis status refresh failed: {exc}",
+                    "MR-MC240N",
+                    dedupe_seconds=10,
+                )
 
     def get_default_stroke_mm(self):
         try:
@@ -4676,7 +4753,8 @@ class ClampTestMachineApp(QMainWindow):
             )
         if not self.is_position_control_armed():
             raise RuntimeError(
-                "MR-MC240N 자동 왕복 시험을 시작하려면 모션 명령 Arm을 활성화해주세요."
+                "MR-MC240N 자동 왕복 시험을 시작하려면 PCIe 제어를 활성화하고 "
+                "연결 상태를 확인해주세요."
             )
 
         minimum_mm = float(self.in_min_len.text())
