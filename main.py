@@ -423,7 +423,9 @@ class ClampTestMachineApp(QMainWindow):
         self.position_axis_live_timer = QTimer(self)
         self.position_axis_live_timer.setInterval(POSITION_AXIS_LIVE_REFRESH_MS)
         self.position_axis_live_timer.timeout.connect(
-            lambda: self.refresh_position_axis_status(report_error=False)
+            lambda: self.refresh_position_axis_status(
+                report_error=False, log_status=False
+            )
         )
         self.position_motion_status_deadline = 0.0
         self.position_motion_status_failures = 0
@@ -822,6 +824,7 @@ class ClampTestMachineApp(QMainWindow):
 
         self.chk_position_monitor = QCheckBox("Enable MR-MC240N position board")
         self.chk_position_monitor.toggled.connect(self.on_position_monitor_toggled)
+        self.chk_position_monitor.setVisible(False)
         if os.name != "nt":
             self.chk_position_monitor.setEnabled(False)
 
@@ -962,7 +965,6 @@ class ClampTestMachineApp(QMainWindow):
         position_settings_layout = QVBoxLayout(position_settings_page)
         position_settings_layout.setContentsMargins(0, 0, 0, 0)
         position_settings_layout.setSpacing(12)
-        position_settings_layout.addWidget(self.chk_position_monitor)
         position_settings_layout.addWidget(connection_group)
         position_settings_layout.addStretch(1)
 
@@ -1505,7 +1507,11 @@ class ClampTestMachineApp(QMainWindow):
         self.timer = QTimer()
         self.timer.timeout.connect(self.timer_step)
 
-        self.on_position_monitor_toggled(False)
+        position_enabled_by_default = os.name == "nt"
+        self.chk_position_monitor.blockSignals(True)
+        self.chk_position_monitor.setChecked(position_enabled_by_default)
+        self.chk_position_monitor.blockSignals(False)
+        self.on_position_monitor_toggled(position_enabled_by_default)
         self.update_table_headers()
         self.update_chart()
         self.refresh_ni_devices()
@@ -4541,7 +4547,9 @@ class ClampTestMachineApp(QMainWindow):
                 )
             return False
 
-    def refresh_position_axis_status(self, *_args, report_error=True):
+    def refresh_position_axis_status(
+        self, *_args, report_error=True, log_status=True
+    ):
         self.position_axis_status_checked = False
         self.position_axis_ready = False
         self.position_readiness_detail = "axis status not checked"
@@ -4723,7 +4731,7 @@ class ClampTestMachineApp(QMainWindow):
                             f"MR-MC240N axis {axis}: status read failed - {axis_exc}"
                         )
 
-            if selected_summary:
+            if selected_summary and log_status:
                 self.set_mr_status_text(selected_summary)
             self.update_hardware_readiness_status()
         except Exception as exc:
@@ -4733,7 +4741,7 @@ class ClampTestMachineApp(QMainWindow):
             self.update_hardware_readiness_status()
             if report_error:
                 self.handle_position_command_error("Axis status refresh", exc)
-            else:
+            elif log_status:
                 self.append_system_log(
                     f"Live axis status refresh failed: {exc}",
                     "MR-MC240N",
