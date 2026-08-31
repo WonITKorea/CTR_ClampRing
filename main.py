@@ -2304,46 +2304,57 @@ class ClampTestMachineApp(QMainWindow):
         center_x, center_y = center
         max_radius = float(np.hypot(max(center_x, width - center_x), max(center_y, height - center_y)))
         angles = np.linspace(0.0, 2.0 * np.pi, self.camera_profile_sample_count, endpoint=False)
+        radii = np.arange(0.0, max_radius + self.camera_profile_sampling_step_px, self.camera_profile_sampling_step_px)
+
+        # Sample every ray in one NumPy operation. Camera analysis calls this for
+        # every candidate component, so avoiding the per-angle Python loop keeps
+        # the UI thread responsive at high camera resolutions.
+        cosines = np.cos(angles)
+        sines = np.sin(angles)
+        sample_x = np.clip(
+            np.rint(center_x + cosines[:, None] * radii[None, :]).astype(np.int32),
+            0,
+            width - 1,
+        )
+        sample_y = np.clip(
+            np.rint(center_y + sines[:, None] * radii[None, :]).astype(np.int32),
+            0,
+            height - 1,
+        )
+        mask_hits = component_mask[sample_y, sample_x] > 0
+        valid_array = np.any(mask_hits, axis=1)
+        first_indices = np.argmax(mask_hits, axis=1)
+        last_indices = mask_hits.shape[1] - 1 - np.argmax(mask_hits[:, ::-1], axis=1)
 
         outer_radii = []
         inner_radii = []
         outer_points = []
         inner_points = []
-        valid_mask = []
-
-        radii = np.arange(0.0, max_radius + self.camera_profile_sampling_step_px, self.camera_profile_sampling_step_px)
-        for angle in angles:
-            cos_theta = np.cos(angle)
-            sin_theta = np.sin(angle)
-            sample_x = np.clip(np.rint(center_x + cos_theta * radii).astype(np.int32), 0, width - 1)
-            sample_y = np.clip(np.rint(center_y + sin_theta * radii).astype(np.int32), 0, height - 1)
-            mask_hits = component_mask[sample_y, sample_x] > 0
-            hit_indices = np.flatnonzero(mask_hits)
-            if hit_indices.size == 0:
+        valid_mask = valid_array.tolist()
+        for ray_index, is_valid in enumerate(valid_mask):
+            if not is_valid:
                 outer_radii.append(None)
                 inner_radii.append(None)
                 outer_points.append(None)
                 inner_points.append(None)
-                valid_mask.append(False)
                 continue
 
-            first_idx = int(hit_indices[0])
-            last_idx = int(hit_indices[-1])
-            inner_radius = float(radii[first_idx])
-            outer_radius = float(radii[last_idx])
-            inner_point = (
-                float(center_x + cos_theta * inner_radius),
-                float(center_y + sin_theta * inner_radius),
-            )
-            outer_point = (
-                float(center_x + cos_theta * outer_radius),
-                float(center_y + sin_theta * outer_radius),
-            )
+            inner_radius = float(radii[first_indices[ray_index]])
+            outer_radius = float(radii[last_indices[ray_index]])
             inner_radii.append(inner_radius)
             outer_radii.append(outer_radius)
-            inner_points.append(inner_point)
-            outer_points.append(outer_point)
-            valid_mask.append(True)
+            inner_points.append(
+                (
+                    float(center_x + cosines[ray_index] * inner_radius),
+                    float(center_y + sines[ray_index] * inner_radius),
+                )
+            )
+            outer_points.append(
+                (
+                    float(center_x + cosines[ray_index] * outer_radius),
+                    float(center_y + sines[ray_index] * outer_radius),
+                )
+            )
 
         valid_outer_radii = np.array([radius for radius in outer_radii if radius is not None], dtype=np.float32)
         valid_inner_radii = np.array([radius for radius in inner_radii if radius is not None], dtype=np.float32)
@@ -5523,9 +5534,16 @@ class ClampTestMachineApp(QMainWindow):
             zero_display = self.sensor_zeros[i]
             calibrated_base = self.raw_data[i] - self.sensor_zeros[i]
             calibrated_display = self.convert_value_units(calibrated_base, self.data_unit, self.unit)
-            self.table.setItem(i, 1, QTableWidgetItem(f"{raw_display:.2f}"))
-            self.table.setItem(i, 2, QTableWidgetItem(f"{zero_display:.2f}"))
-            self.table.setItem(i, 3, QTableWidgetItem(f"{calibrated_display:.2f}"))
+            for column, text in (
+                (1, f"{raw_display:.2f}"),
+                (2, f"{zero_display:.2f}"),
+                (3, f"{calibrated_display:.2f}"),
+            ):
+                item = self.table.item(i, column)
+                if item is None:
+                    self.table.setItem(i, column, QTableWidgetItem(text))
+                elif item.text() != text:
+                    item.setText(text)
 
     def get_calibrated_data(self):
         data = []
