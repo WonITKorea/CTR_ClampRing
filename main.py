@@ -111,6 +111,9 @@ FC400_NI_ZERO_VOLTAGE = 0.0
 FC400_NI_FULL_SCALE_VOLTAGE = 10.0
 FC400_NI_FULL_SCALE_LOAD = 1000.0
 FC400_NI_SAMPLE_RATE_HZ = 1000
+DAQ_LIVE_REFRESH_MS = 100
+# Rotate all load charts 150 degrees counterclockwise from Axis 1 at the top.
+LOAD_CHART_THETA_OFFSET_RAD = np.pi / 2 + np.deg2rad(150.0)
 
 try:
     import cv2
@@ -238,7 +241,7 @@ plt.rcParams['axes.unicode_minus'] = False
 
 class SpiderChartCanvas(FigureCanvas):
     def __init__(self, parent=None, width=6, height=5, dpi=100):
-        self.fig = plt.Figure(figsize=(width, height), dpi=dpi)
+        self.fig = plt.Figure(figsize=(width, height), dpi=dpi, layout="constrained")
         self.ax = self.fig.add_subplot(111, polar=True)
         super(SpiderChartCanvas, self).__init__(self.fig)
         self.angles = np.linspace(0, 2 * np.pi, 6, endpoint=False).tolist()
@@ -278,7 +281,7 @@ class SpiderChartCanvas(FigureCanvas):
             self.reset_scale()
 
         self.ax.clear()
-        self.ax.set_theta_offset(np.pi / 2)
+        self.ax.set_theta_offset(LOAD_CHART_THETA_OFFSET_RAD)
         self.ax.set_theta_direction(-1)
         self.ax.set_xticks(self.angles)
         self.ax.set_xticklabels(['Axis 1', 'Axis 2', 'Axis 3', 'Axis 4', 'Axis 5', 'Axis 6'], fontproperties=font_prop)
@@ -303,7 +306,8 @@ class SpiderChartCanvas(FigureCanvas):
         self.radius_limit = max(self.radius_limit, self.min_radius_limit)
 
         self.ax.set_ylim(0, self.radius_limit)
-        self.ax.set_ylabel(f"Load ({unit})", labelpad=20, fontproperties=font_prop)
+        # Keep the unit above the plot, clear of the rotated Axis 2 label.
+        self.ax.set_title(f"Load ({unit})", pad=12, fontproperties=font_prop, fontsize=10)
 
         plot_data = data + [data[0]]
 
@@ -406,12 +410,22 @@ class ClampTestMachineApp(QMainWindow):
         self.raw_data = [0.0] * 6
         self.latest_live_snapshot = [0.0] * 6
         self.ni_daq_task = None
+        self.daq_live_enabled = False
+        self.latest_daq_voltages = [None] * 6
+        self.daq_live_timer = QTimer(self)
+        self.daq_live_timer.setInterval(DAQ_LIVE_REFRESH_MS)
+        self.daq_live_timer.timeout.connect(self.poll_daq_live)
         self.position_monitor = None
         self.position_jog_command_active = False
         self.position_jog_direction = None
         self.position_motion_may_be_active = False
+        self.position_active_axes = set()
+        self.position_motion_kind = ""
+        self.position_motion_target_counts = {}
         self.position_home_established = False
         self.position_home_command_pending = False
+        self.position_home_pending_axes = set()
+        self.position_home_established_axes = set()
         self.position_controller_close_failed = False
         self.latest_live_position_mm = None
         self.latest_live_position_counts = None
@@ -424,6 +438,7 @@ class ClampTestMachineApp(QMainWindow):
         self.live_motion_cycle_active = False
         self.live_motion_config = None
         self.live_motion_target_mm = None
+        self.live_motion_positions_mm = {}
         self.live_motion_deadline = 0.0
         self.live_hold_deadline = 0.0
         self.live_stroke_peak_values = None
@@ -785,13 +800,14 @@ class ClampTestMachineApp(QMainWindow):
 
         layout_fc400.addWidget(QLabel("기기 채널:"), 0, 0)
         self.in_fc400_daq_channel = QLineEdit(FC400_NI_PHYSICAL_CHANNEL)
-        self.in_fc400_daq_channel.editingFinished.connect(self.refresh_ni_devices)
+        self.in_fc400_daq_channel.editingFinished.connect(self.on_daq_acquisition_changed)
         layout_fc400.addWidget(self.in_fc400_daq_channel, 0, 1)
 
         layout_fc400.addWidget(QLabel("모드:"), 1, 0)
         self.fc400_terminal_combo = QComboBox()
         self.fc400_terminal_combo.addItems(["Differential", "RSE"])
         self.fc400_terminal_combo.setCurrentText(FC400_NI_TERMINAL_MODE)
+        self.fc400_terminal_combo.currentTextChanged.connect(self.on_daq_acquisition_changed)
         layout_fc400.addWidget(self.fc400_terminal_combo, 1, 1)
 
         layout_fc400.addWidget(QLabel("무부하 전압 [V]:"), 2, 0)
@@ -834,6 +850,13 @@ class ClampTestMachineApp(QMainWindow):
             "USB-6002 연속 취득 속도",
         )
         layout_fc400.addWidget(self.in_fc400_sample_rate, 6, 1)
+        self.in_fc400_sample_rate.editingFinished.connect(self.on_daq_acquisition_changed)
+        for field in (
+            self.in_fc400_zero_voltage,
+            self.in_fc400_full_scale_voltage,
+            self.in_fc400_full_scale_load,
+        ):
+            field.editingFinished.connect(self.on_source_configuration_changed)
 
         self.btn_refresh_fc400_daq = QPushButton("NI 기기 새로고침")
         self.btn_refresh_fc400_daq.clicked.connect(self.refresh_ni_devices)
@@ -1090,6 +1113,9 @@ class ClampTestMachineApp(QMainWindow):
             lambda: self.start_position_jog(MrMc240nPositionController.SSC_DIR_PLUS)
         )
         self.btn_mr_jog_plus.released.connect(self.stop_position_jog)
+        for button in (self.btn_mr_jog_minus, self.btn_mr_jog_plus):
+            button.setAutoRepeat(False)
+            button.setToolTip("누르고 있는 동안 연속 이동하며, 놓으면 감속 정지합니다.")
         jog_layout.addWidget(self.btn_mr_jog_minus)
         jog_layout.addWidget(self.btn_mr_jog_plus)
         motion_grid.addLayout(jog_layout, 4, 1)
@@ -1098,8 +1124,8 @@ class ClampTestMachineApp(QMainWindow):
         stop_layout.setSpacing(4)
         self.btn_mr_stop = QPushButton("정지")
         self.btn_mr_stop.setToolTip(
-            "Mode-specific deceleration stop; escalates to SEMI software "
-            "forced stop if stopping cannot be confirmed"
+            "6축 연계 시 두 직선보간 그룹에 비동기 감속정지를 연속 전송하고 "
+            "완료를 함께 확인합니다. 확인 실패 시 SEMI 전체 정지로 전환합니다."
         )
         self.btn_mr_stop.clicked.connect(lambda: self.stop_position_motion(False))
         self.btn_mr_rapid_stop = QPushButton("긴급정지")
@@ -1123,7 +1149,15 @@ class ClampTestMachineApp(QMainWindow):
             "(SALM). Remove the alarm cause and stop motion first."
         )
         self.btn_mr_alarm_reset.clicked.connect(self.reset_position_axis_alarms)
-        motion_grid.addWidget(self.btn_mr_alarm_reset, 6, 0, 1, 2)
+        motion_grid.addWidget(self.btn_mr_alarm_reset, 7, 0, 1, 2)
+        self.chk_mr_six_axis_batch = QCheckBox("6축 연계 제어 (3+3 직선보간)")
+        self.chk_mr_six_axis_batch.setChecked(False)
+        self.chk_mr_six_axis_batch.setToolTip(
+            "이동/자동시험은 축 1~3과 4~6을 두 직선보간 그룹으로 묶고 "
+            "OAS 보드 내부 트리거로 연계 기동합니다. 홈/JOG/SON은 축별 "
+            "명령이며, 한 축이라도 오류가 나면 6축 전체 정지합니다."
+        )
+        motion_grid.addWidget(self.chk_mr_six_axis_batch, 6, 0, 1, 2)
         for position_control_button in (
             self.btn_mr_servo_on,
             self.btn_mr_servo_off,
@@ -1145,7 +1179,7 @@ class ClampTestMachineApp(QMainWindow):
         self.lbl_motion_ranges.setStyleSheet(
             "color: #555555; font-size: 11px;"
         )
-        motion_grid.addWidget(self.lbl_motion_ranges, 7, 0, 1, 2)
+        motion_grid.addWidget(self.lbl_motion_ranges, 8, 0, 1, 2)
         layout_position.addWidget(motion_group)
 
         overview_group = QGroupBox("6축 상태")
@@ -1323,6 +1357,9 @@ class ClampTestMachineApp(QMainWindow):
         self.lbl_review_position.setMinimumWidth(120)
         self.lbl_review_position.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         review_layout.addWidget(self.lbl_review_position)
+        self.btn_review_live = QPushButton("실시간 보기")
+        self.btn_review_live.clicked.connect(self.show_live_daq_chart)
+        review_layout.addWidget(self.btn_review_live)
         top_visual_layout.addWidget(review_panel)
 
         group_camera_settings = QGroupBox("Jig / Camera / Ring")
@@ -1515,14 +1552,25 @@ class ClampTestMachineApp(QMainWindow):
         top_visual_layout.insertWidget(0, group_camera_viewfinder, 3)
         right_panel.addLayout(top_visual_layout, 3)
 
-        self.table = QTableWidget(6, 4)
+        self.table = QTableWidget(6, 5)
         self.table.setMinimumHeight(130)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         for i in range(6):
             self.table.setItem(i, 0, QTableWidgetItem(f"Axis {i+1}"))
             for j in range(1, 4):
                 self.table.setItem(i, j, QTableWidgetItem("0.00"))
+            self.table.setItem(i, 4, QTableWidgetItem("--"))
         right_panel.addWidget(self.table, 1)
+
+        daq_live_layout = QHBoxLayout()
+        self.chk_daq_live = QCheckBox("DAQ 실시간")
+        self.chk_daq_live.setChecked(True)
+        self.chk_daq_live.setToolTip("시험 전후에도 6채널 전압과 하중을 0.1초마다 갱신합니다.")
+        self.chk_daq_live.toggled.connect(self.set_daq_live_enabled)
+        self.lbl_daq_live = QLabel("DAQ 대기")
+        daq_live_layout.addWidget(self.chk_daq_live)
+        daq_live_layout.addWidget(self.lbl_daq_live, 1)
+        right_panel.addLayout(daq_live_layout)
 
         btn_layout = QHBoxLayout()
         self.btn_csv = QPushButton("CSV 데이터 저장")
@@ -2952,6 +3000,7 @@ class ClampTestMachineApp(QMainWindow):
                 f"Raw Data [{self.data_unit}]",
                 f"Zero Offset [{self.data_unit}]",
                 f"Calibrated Value [{self.unit}]",
+                "DAQ [V]",
             ]
         )
 
@@ -2973,10 +3022,14 @@ class ClampTestMachineApp(QMainWindow):
             self.in_mr_acceleration_ms,
             self.in_mr_deceleration_ms,
             self.in_mr_relative_move_mm,
+            self.chk_mr_six_axis_batch,
         ]
         for widget in configuration_widgets:
             widget.setEnabled(enabled)
         self.chk_mr_auto_start.setEnabled(
+            enabled and not self.is_position_usb_mode()
+        )
+        self.chk_mr_six_axis_batch.setEnabled(
             enabled and not self.is_position_usb_mode()
         )
 
@@ -3196,6 +3249,7 @@ class ClampTestMachineApp(QMainWindow):
             self.in_mr_acceleration_ms,
             self.in_mr_deceleration_ms,
             self.in_mr_relative_move_mm,
+            self.chk_mr_six_axis_batch,
         ]
         for widget in configuration_widgets:
             widget.setEnabled(enabled and not configuration_locked)
@@ -3231,22 +3285,39 @@ class ClampTestMachineApp(QMainWindow):
             and not self.is_position_usb_mode()
             and not configuration_locked
         )
+        self.chk_mr_six_axis_batch.setEnabled(
+            enabled
+            and not self.is_position_usb_mode()
+            and not configuration_locked
+        )
         self.chk_mr_motion_arm.setEnabled(False)
+        manual_motion_enabled = (
+            armed
+            and not self.is_test_running
+            and not self.live_motion_cycle_active
+            and not self.position_controller_close_failed
+        )
         motion_buttons = [
             self.btn_mr_servo_on,
             self.btn_mr_servo_off,
             self.btn_mr_home,
             self.btn_mr_move_relative,
-            self.btn_mr_jog_minus,
-            self.btn_mr_jog_plus,
         ]
         for button in motion_buttons:
+            button.setEnabled(manual_motion_enabled and not motion_may_be_active)
+        for button, direction in (
+            (self.btn_mr_jog_minus, MrMc240nPositionController.SSC_DIR_MINUS),
+            (self.btn_mr_jog_plus, MrMc240nPositionController.SSC_DIR_PLUS),
+        ):
+            # Qt emits released when a pressed button is disabled. Keep the
+            # active JOG direction enabled so only a real release stops it.
+            active_jog_direction = (
+                self.position_jog_command_active
+                and self.position_jog_direction == direction
+            )
             button.setEnabled(
-                armed
-                and not self.is_test_running
-                and not self.live_motion_cycle_active
-                and not motion_may_be_active
-                and not self.position_controller_close_failed
+                manual_motion_enabled
+                and (not motion_may_be_active or active_jog_direction)
             )
         self.btn_mr_stop.setEnabled(control_enabled)
         self.btn_mr_rapid_stop.setEnabled(control_enabled)
@@ -3267,23 +3338,39 @@ class ClampTestMachineApp(QMainWindow):
                 raise RuntimeError(
                     "Alarm Reset is available only with PCIe control (API)."
                 )
-            status = controller.reset_axis_alarms()
-            active = []
-            if status.get("operation_alarm"):
-                active.append("OALM")
-            if status.get("servo_alarm"):
-                active.append("SALM")
-            if active:
-                raise RuntimeError(
-                    f"Axis {controller.axis_number} alarm reset was sent, but "
-                    f"{', '.join(active)} remains active. Remove the alarm cause "
-                    "and retry."
-                )
+            if self.is_six_axis_batch_enabled():
+                statuses = controller.reset_axis_alarms_axes(range(1, 7))
+                remaining = [
+                    str(axis)
+                    for axis, status in statuses.items()
+                    if status.get("operation_alarm") or status.get("servo_alarm")
+                ]
+                if remaining:
+                    raise RuntimeError(
+                        "Alarm reset was sent, but alarms remain on axes "
+                        + ", ".join(remaining)
+                        + ". Remove the cause and retry."
+                    )
+                target_text = "axes 1-6"
+            else:
+                status = controller.reset_axis_alarms()
+                active = []
+                if status.get("operation_alarm"):
+                    active.append("OALM")
+                if status.get("servo_alarm"):
+                    active.append("SALM")
+                if active:
+                    raise RuntimeError(
+                        f"Axis {controller.axis_number} alarm reset was sent, but "
+                        f"{', '.join(active)} remains active. Remove the alarm cause "
+                        "and retry."
+                    )
+                target_text = f"axis {controller.axis_number}"
             self.set_mr_status_text(
-                f"MR-MC240N: axis {controller.axis_number} OALM/SALM reset completed"
+                f"MR-MC240N: {target_text} OALM/SALM reset completed"
             )
             self.append_system_log(
-                f"Axis {controller.axis_number} operation/servo alarm reset completed",
+                f"{target_text} operation/servo alarm reset completed",
                 "MR-MC240N",
                 dedupe_seconds=0,
             )
@@ -3291,7 +3378,7 @@ class ClampTestMachineApp(QMainWindow):
             QMessageBox.information(
                 self,
                 "MR-MC240N Alarm Reset",
-                f"Axis {controller.axis_number} OALM/SALM reset completed.",
+                f"{target_text} OALM/SALM reset completed.",
             )
         except Exception as exc:
             self.handle_position_command_error("Alarm Reset", exc)
@@ -3498,6 +3585,89 @@ class ClampTestMachineApp(QMainWindow):
         self.update_table()
         self.update_chart(reset_scale=True)
         self.update_hardware_readiness_status()
+        if self.daq_live_enabled:
+            self.daq_live_timer.start()
+
+    def on_daq_acquisition_changed(self, *_args):
+        if self.is_test_running:
+            return
+        self.close_ni_daq_task()
+        self.latest_daq_voltages = [None] * 6
+        self.update_table()
+        self.refresh_ni_devices()
+
+    def start_daq_live_monitor(self):
+        self.set_daq_live_enabled(True)
+
+    def set_daq_live_enabled(self, enabled):
+        self.daq_live_enabled = bool(enabled)
+        self.chk_daq_live.blockSignals(True)
+        self.chk_daq_live.setChecked(self.daq_live_enabled)
+        self.chk_daq_live.blockSignals(False)
+        if self.daq_live_enabled:
+            self.lbl_daq_live.setText("DAQ 연결/샘플 대기")
+            self.daq_live_timer.start()
+        else:
+            self.daq_live_timer.stop()
+            # The test owns the same task while running, including overload
+            # sampling. Turning off the idle preview must not stop that task.
+            if not self.is_test_running:
+                self.close_ni_daq_task()
+                self.lbl_daq_live.setText("DAQ 정지 · 마지막 수신값")
+
+    def show_live_daq_chart(self):
+        self.review_selected_data_index = None
+        self.lbl_review_position.setText("LIVE")
+        self.update_chart()
+
+    def update_daq_measurement_status(self, measurement):
+        voltages = measurement.get("voltages")
+        self.latest_daq_voltages = (
+            list(voltages) if voltages is not None else [None] * 6
+        )
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        mode = "실시간 DAQ" if self.daq_live_enabled or self.is_test_running else "DAQ 단일 측정"
+        self.lbl_daq_live.setText(
+            f"표: {mode} · {len(self.latest_daq_voltages)}채널 · {timestamp}"
+        )
+        self.lbl_daq_live.setToolTip(self.in_fc400_daq_channel.text().strip())
+
+    def poll_daq_live(self):
+        # Only the test may drain samples while it is running: otherwise the
+        # preview could consume a load peak before the overload check sees it.
+        if not self.daq_live_enabled or self.is_test_running:
+            return
+        try:
+            measurement = self.read_fc400_measurement(wait_for_samples=False)
+            if measurement is None:
+                self.lbl_daq_live.setText("DAQ 샘플 대기 · 마지막 수신값")
+                return
+            values = list(measurement["values"])
+            if len(values) != 6:
+                raise RuntimeError(
+                    f"DAQ가 {len(values)}채널을 반환했습니다. AI0:5의 6채널 설정을 확인하세요."
+                )
+            self.raw_data = values
+            self.update_daq_measurement_status(measurement)
+            self.update_table()
+            if self.review_selected_data_index is None:
+                self.lbl_review_position.setText("LIVE")
+                self.update_chart()
+            # Preview samples are deliberately not appended to test records,
+            # nor used to replace the final test snapshot for later export.
+        except Exception as exc:
+            self.daq_live_timer.stop()
+            self.close_ni_daq_task()
+            self.fc400_device_ready = False
+            self.fc400_readiness_detail = "live DAQ read failed"
+            self.latest_daq_voltages = [None] * 6
+            self.update_table()
+            self.lbl_daq_live.setText("DAQ 오류 · 갱신 중단 (마지막 하중)")
+            self.lbl_daq_live.setToolTip(str(exc))
+            self.set_fc400_status_text(
+                f"DAQ 실시간 수신 중단: {exc}. NI 기기 새로고침으로 재연결하세요."
+            )
+            self.update_hardware_readiness_status()
 
     def update_start_button_idle_state(self):
         self.btn_start.setText("FC400 + MR-MC240N 시험 시작")
@@ -3605,6 +3775,9 @@ class ClampTestMachineApp(QMainWindow):
                 f"USB-6002: device scan failed - {exc}"
             )
         self.update_hardware_readiness_status()
+        if self.daq_live_enabled and not self.is_test_running:
+            self.lbl_daq_live.setText("DAQ 연결/샘플 대기")
+            self.daq_live_timer.start()
 
     def close_ni_daq_task(self):
         if self.ni_daq_task is None:
@@ -3622,7 +3795,7 @@ class ClampTestMachineApp(QMainWindow):
 
         self.ni_daq_task = None
 
-    def read_ni_daq_samples(self):
+    def read_ni_daq_samples(self, *, wait_for_samples=True):
         """Return voltage samples as ``channels x samples`` lists."""
         opened_here = False
         if self.ni_daq_task is None:
@@ -3632,13 +3805,15 @@ class ClampTestMachineApp(QMainWindow):
         try:
             available_samples = self.ni_daq_task.in_stream.avail_samp_per_chan
             if available_samples < 1:
+                if not wait_for_samples:
+                    return None
                 value = self.ni_daq_task.read(
                     number_of_samples_per_channel=1, timeout=1.0
                 )
             else:
                 value = self.ni_daq_task.read(
                     number_of_samples_per_channel=READ_ALL_AVAILABLE,
-                    timeout=1.0,
+                    timeout=1.0 if wait_for_samples else 0.0,
                 )
             samples = np.asarray(value, dtype=float)
             if samples.size == 0:
@@ -3661,7 +3836,7 @@ class ClampTestMachineApp(QMainWindow):
                 )
             return samples.tolist()
         finally:
-            if opened_here and not self.is_test_running:
+            if opened_here and not self.is_test_running and not self.daq_live_enabled:
                 self.close_ni_daq_task()
 
     def read_ni_daq_value(self):
@@ -3751,14 +3926,18 @@ class ClampTestMachineApp(QMainWindow):
         )
         self.update_hardware_readiness_status()
 
-    def read_fc400_measurement(self):
+    def read_fc400_measurement(self, *, wait_for_samples=True):
         opened_here = False
         if self.ni_daq_task is None:
             self.open_fc400_usb_task()
             opened_here = True
 
         try:
-            voltage_samples_by_channel = self.read_ni_daq_samples()
+            voltage_samples_by_channel = self.read_ni_daq_samples(
+                wait_for_samples=wait_for_samples
+            )
+            if voltage_samples_by_channel is None:
+                return None
             config = self.get_fc400_config()
             voltage_span = config["full_scale_voltage"] - config["zero_voltage"]
             load_samples_by_channel = [
@@ -3791,7 +3970,7 @@ class ClampTestMachineApp(QMainWindow):
                 "voltages": voltage_values,
             }
         finally:
-            if opened_here and not self.is_test_running:
+            if opened_here and not self.is_test_running and not self.daq_live_enabled:
                 self.close_ni_daq_task()
 
     def get_position_monitor_config(self):
@@ -3813,6 +3992,33 @@ class ClampTestMachineApp(QMainWindow):
             "counts_per_mm": counts_per_mm,
             "auto_start_system": self.chk_mr_auto_start.isChecked(),
         }
+
+    def is_six_axis_batch_enabled(self):
+        return bool(
+            hasattr(self, "chk_mr_six_axis_batch")
+            and self.chk_mr_six_axis_batch.isChecked()
+            and not self.is_position_usb_mode()
+        )
+
+    def get_position_command_axes(self):
+        if self.is_six_axis_batch_enabled():
+            return tuple(range(1, 7))
+        return (int(self.in_mr_axis_no.currentText()),)
+
+    def begin_position_batch_tracking(
+        self,
+        axes,
+        motion_kind,
+        target_counts=None,
+    ):
+        self.position_active_axes = set(int(axis) for axis in axes)
+        self.position_motion_kind = str(motion_kind)
+        self.position_motion_target_counts = dict(target_counts or {})
+
+    def clear_position_batch_tracking(self):
+        self.position_active_axes.clear()
+        self.position_motion_kind = ""
+        self.position_motion_target_counts = {}
 
     def get_position_motion_config(self):
         speed = int(self.in_mr_motion_speed.text())
@@ -3962,7 +4168,7 @@ class ClampTestMachineApp(QMainWindow):
         )
         if motion_may_be_active:
             try:
-                if self.load_limit_tripped:
+                if self.load_limit_tripped or len(self.position_active_axes) > 1:
                     monitor.stop_all_axes(
                         axis_numbers=range(1, 7),
                         rapid=True,
@@ -3973,6 +4179,7 @@ class ClampTestMachineApp(QMainWindow):
                 self.position_jog_command_active = False
                 self.position_jog_direction = None
                 self.position_motion_may_be_active = False
+                self.clear_position_batch_tracking()
             except Exception as exc:
                 self.position_axis_status_checked = False
                 self.position_axis_ready = False
@@ -4014,8 +4221,11 @@ class ClampTestMachineApp(QMainWindow):
         self.position_jog_command_active = False
         self.position_jog_direction = None
         self.position_motion_may_be_active = False
+        self.clear_position_batch_tracking()
         self.position_home_established = False
         self.position_home_command_pending = False
+        self.position_home_pending_axes.clear()
+        self.position_home_established_axes.clear()
         self.position_controller_close_failed = False
         self.position_monitor = None
         self.position_axis_live_timer.stop()
@@ -4066,13 +4276,39 @@ class ClampTestMachineApp(QMainWindow):
         )
 
     def require_position_home_established(self, controller):
-        if self.position_home_established:
+        if self.is_six_axis_batch_enabled():
+            axes = tuple(range(1, 7))
+            statuses = {
+                axis: controller.read_axis_status(axis, track_motion=False)
+                for axis in axes
+            }
+            homed_axes = {
+                axis
+                for axis, status in statuses.items()
+                if status.get("home_established", status.get("home_complete", False))
+            }
+            self.position_home_established_axes.difference_update(axes)
+            self.position_home_established_axes.update(homed_axes)
+            self.position_home_established = len(homed_axes) == len(axes)
+            if self.position_home_established:
+                self.position_zero_offset_mm = 0.0
+                return
+            missing = sorted(set(axes) - homed_axes)
+            raise RuntimeError(
+                "6축 일괄 시험 전에 모든 축의 DOG 홈 복귀가 필요합니다. "
+                f"홈 미완료 축: {', '.join(map(str, missing))}."
+            )
+        if self.position_home_established and isinstance(controller, MrMc240nUsbController):
             return
         axis_status = controller.read_axis_status()
-        if axis_status.get("home_complete"):
-            self.position_home_established = True
+        self.position_home_established = bool(
+            axis_status.get("home_established", axis_status.get("home_complete", False))
+        )
+        if self.position_home_established:
+            self.position_home_established_axes.add(controller.axis_number)
             self.position_zero_offset_mm = 0.0
             return
+        self.position_home_established_axes.discard(controller.axis_number)
         raise RuntimeError(
             "자동 반복 시험의 절대 위치 기준이 설정되지 않았습니다. "
             "DOG 홈 입력과 하드웨어 리밋을 확인한 다음 '홈 복귀'를 먼저 누르세요."
@@ -4130,6 +4366,7 @@ class ClampTestMachineApp(QMainWindow):
             return
         if not controller._motion_command_may_be_active:
             self.position_motion_may_be_active = False
+            self.clear_position_batch_tracking()
             self.stop_position_motion_status_monitor()
             self.update_position_control_state()
             return
@@ -4150,8 +4387,20 @@ class ClampTestMachineApp(QMainWindow):
                 ),
             )
             return
+        batch_axes = sorted(self.position_active_axes)
+        batch_statuses = {}
         try:
-            axis_status = controller.read_axis_status()
+            if len(batch_axes) > 1:
+                batch_statuses = {
+                    axis: controller.read_axis_status(axis, track_motion=False)
+                    for axis in batch_axes
+                }
+                axis_status = batch_statuses.get(
+                    controller.axis_number,
+                    batch_statuses[batch_axes[0]],
+                )
+            else:
+                axis_status = controller.read_axis_status()
         except Exception as exc:
             self.position_motion_status_failures += 1
             if self.position_motion_status_failures >= 3:
@@ -4237,16 +4486,94 @@ class ClampTestMachineApp(QMainWindow):
             )
             return
 
-        if self.position_home_command_pending and axis_status["home_complete"]:
-            self.position_home_command_pending = False
-            self.position_home_established = True
-            self.position_zero_offset_mm = 0.0
-            self.append_system_log(
-                "Axis 1 DOG home completed at 0 mm; software limits "
-                "remain disabled and hardware limit inputs remain active",
-                "MR-MC240N",
-                dedupe_seconds=0,
+        if batch_statuses:
+            alarm_axes = [
+                axis
+                for axis, status in batch_statuses.items()
+                if status["servo_alarm"] or status["operation_alarm"]
+            ]
+            if alarm_axes:
+                self.stop_all_position_axes(
+                    reason=f"axis alarm on {alarm_axes}", report_error=False
+                )
+                QMessageBox.critical(
+                    self,
+                    "Six-axis Motion Alarm",
+                    "일괄 운전 중 알람이 발생한 축: "
+                    + ", ".join(map(str, alarm_axes))
+                    + ". 6축 전체 정지를 요청했습니다.",
+                )
+                return
+
+        if self.position_home_command_pending:
+            if batch_statuses:
+                completed_home_axes = {
+                    axis
+                    for axis, status in batch_statuses.items()
+                    if status["home_complete"] and not status["operating"]
+                }
+                self.position_home_pending_axes.difference_update(
+                    completed_home_axes
+                )
+                if not self.position_home_pending_axes:
+                    self.position_home_command_pending = False
+                    self.position_home_established = True
+                    self.position_home_established_axes.update(batch_axes)
+                    self.position_zero_offset_mm = 0.0
+                    controller._clear_motion_latch()
+            elif axis_status["home_complete"]:
+                self.position_home_command_pending = False
+                self.position_home_pending_axes.discard(controller.axis_number)
+                self.position_home_established = True
+                self.position_home_established_axes.add(controller.axis_number)
+                self.position_zero_offset_mm = 0.0
+            if not self.position_home_command_pending:
+                self.append_system_log(
+                    f"Axes {batch_axes if batch_statuses else [controller.axis_number]} "
+                    "DOG home completed at 0 mm; software limits remain "
+                    "disabled and hardware limit inputs remain active",
+                    "MR-MC240N",
+                    dedupe_seconds=0,
+                )
+
+        if batch_statuses and self.position_motion_kind == "linear":
+            link_status = controller.read_six_axis_link_status()
+            if link_status["failed"]:
+                self.stop_all_position_axes(
+                    reason="OAS group-2 linked start failed",
+                    report_error=False,
+                )
+                QMessageBox.critical(
+                    self,
+                    "Six-axis Interpolation Start Error",
+                    "그룹 2의 OAS 연계 기동에 실패하여 6축 전체 정지를 "
+                    "요청했습니다. 축 4~6의 LIP 모드, 홈 완료 및 알람을 "
+                    "확인하세요.",
+                )
+                return
+
+        if batch_statuses and self.position_motion_kind in {"relative", "linear"}:
+            count_tolerance = max(
+                2,
+                round(
+                    self.get_position_monitor_config()["counts_per_mm"] * 0.01
+                ),
             )
+            all_complete = all(
+                not status["operating"]
+                and (
+                    status.get("in_position", False)
+                    or status.get("operation_complete", False)
+                )
+                and abs(
+                    int(status["position"])
+                    - int(self.position_motion_target_counts[axis])
+                )
+                <= count_tolerance
+                for axis, status in batch_statuses.items()
+            )
+            if all_complete:
+                controller._clear_motion_latch()
 
         if HOST_SOFTWARE_LIMITS_ENABLED and self.position_jog_command_active:
             motion_config = self.get_position_motion_config()
@@ -4300,19 +4627,32 @@ class ClampTestMachineApp(QMainWindow):
             return
         if not controller._motion_command_may_be_active:
             self.position_motion_may_be_active = False
+            completed_axes = sorted(self.position_active_axes)
+            self.clear_position_batch_tracking()
             self.stop_position_motion_status_monitor()
             self.update_position_control_state()
             self.set_mr_status_text(
-                f"MR-MC240N: axis {controller.axis_number} motion completion confirmed"
+                "MR-MC240N: "
+                + (
+                    f"axes {completed_axes}"
+                    if len(completed_axes) > 1
+                    else f"axis {controller.axis_number}"
+                )
+                + " motion completion confirmed"
             )
 
     def set_position_servo(self, enabled):
         action = "Servo ON" if enabled else "Servo OFF"
         try:
             controller = self.get_position_controller(require_armed=True)
-            controller.set_servo_on(enabled)
+            if self.is_six_axis_batch_enabled():
+                controller.set_servo_on_axes(enabled, axis_numbers=range(1, 7))
+                target_text = "axes 1-6"
+            else:
+                controller.set_servo_on(enabled)
+                target_text = f"axis {controller.axis_number}"
             self.set_mr_status_text(
-                f"MR-MC240N: {action} command sent to axis {controller.axis_number}"
+                f"MR-MC240N: {action} command sent to {target_text}"
             )
             self.refresh_position_axis_status()
             if enabled:
@@ -4325,12 +4665,15 @@ class ClampTestMachineApp(QMainWindow):
             self.handle_position_command_error(action, exc)
 
     def start_position_home(self):
+        batch_enabled = self.is_six_axis_batch_enabled()
+        axis_text = "축 1~6이" if batch_enabled else "선택 축이"
         answer = QMessageBox.question(
             self,
-            "Home Return to DOG Sensor",
-            "축이 마이너스 방향의 별도 DOG 홈 스위치로 이동합니다.\n\n"
+            "DOG Cradle Home Return",
+            f"{axis_text} 마이너스 방향의 각 DOG 홈 스위치로 이동합니다. 감지 후 "
+            "반대 방향으로 이탈한 다음 저속으로 다시 접근합니다.\n\n"
             "이동 경로가 비어 있고 DOG 입력이 스위치 ON에서 검출되는지 확인했습니까?\n"
-            "접근 속도는 500 mm/min, 센서 이탈 속도는 50 mm/min입니다. "
+            "접근 속도는 500 mm/min, 센서 감지 후 속도는 100 mm/min입니다. "
             "완료 위치가 0 mm로 설정되며 소프트웨어 리밋은 비활성 상태로 유지됩니다.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -4340,16 +4683,23 @@ class ClampTestMachineApp(QMainWindow):
         controller = None
         try:
             controller = self.get_position_controller(require_armed=True)
-            controller.start_home_return()
+            axes = self.get_position_command_axes()
+            if batch_enabled:
+                controller.start_home_return_axes(axis_numbers=axes)
+            else:
+                controller.start_home_return()
+            self.begin_position_batch_tracking(axes, "home")
             self.position_home_command_pending = True
+            self.position_home_pending_axes = set(axes)
             self.position_motion_may_be_active = (
                 controller._motion_command_may_be_active
             )
             self.begin_position_motion_status_monitor()
             self.update_position_control_state()
             self.set_mr_status_text(
-                f"MR-MC240N: axis {controller.axis_number} home return started "
-                "toward the minus-direction DOG home sensor"
+                f"MR-MC240N: {'axes 1-6' if batch_enabled else f'axis {controller.axis_number}'} "
+                "DOG cradle home "
+                "return started toward the minus direction"
             )
         except Exception as exc:
             if controller is not None:
@@ -4360,7 +4710,9 @@ class ClampTestMachineApp(QMainWindow):
                 self.update_position_control_state()
             if not self.position_motion_may_be_active:
                 self.position_home_command_pending = False
-            self.handle_position_command_error("Home return to DOG sensor", exc)
+                self.position_home_pending_axes.clear()
+                self.clear_position_batch_tracking()
+            self.handle_position_command_error("DOG cradle home return", exc)
 
     def start_position_relative_move(self):
         controller = None
@@ -4370,28 +4722,6 @@ class ClampTestMachineApp(QMainWindow):
                 self.require_position_home_established(controller)
             board_config = self.get_position_monitor_config()
             motion_config = self.get_position_motion_config()
-            current_position_mm, current_position_counts = (
-                self.read_position_feedback()
-            )
-            if current_position_counts is None:
-                raise RuntimeError("현재 축 위치를 읽지 못했습니다.")
-            machine_position_mm = self.machine_position_mm_from_counts(
-                current_position_counts,
-                board_config["counts_per_mm"],
-            )
-            target_machine_position_mm = (
-                machine_position_mm + motion_config["distance_mm"]
-            )
-            if HOST_SOFTWARE_LIMITS_ENABLED and not (
-                AXIS_TRAVEL_MIN_MM
-                <= target_machine_position_mm
-                <= AXIS_TRAVEL_MAX_MM
-            ):
-                raise ValueError(
-                    f"요청 목표 기계 위치 {target_machine_position_mm:.3f} mm가 "
-                    f"소프트 리미트 {AXIS_TRAVEL_MIN_MM:g}~"
-                    f"{AXIS_TRAVEL_MAX_MM:g} mm를 벗어납니다."
-                )
             distance_counts = round(
                 motion_config["distance_mm"] * board_config["counts_per_mm"]
             )
@@ -4404,11 +4734,68 @@ class ClampTestMachineApp(QMainWindow):
                     "Relative Move command exceeds the MR-MC240N signed "
                     "32-bit command-unit range."
                 )
-            controller.move_relative(
-                distance_counts,
-                motion_config["speed"],
-                motion_config["acceleration_ms"],
-                motion_config["deceleration_ms"],
+            axes = self.get_position_command_axes()
+            target_counts = {}
+            if self.is_six_axis_batch_enabled():
+                for axis in axes:
+                    status = controller.read_axis_status(
+                        axis, track_motion=False
+                    )
+                    current_counts = int(status["position"])
+                    if current_counts == ENCODER_INITIAL_POSITION_COUNTS:
+                        raise RuntimeError(
+                            f"축 {axis} 엔코더 위치가 아직 초기화 중입니다."
+                        )
+                    target_counts[axis] = current_counts + distance_counts
+                    target_mm = self.machine_position_mm_from_counts(
+                        target_counts[axis], board_config["counts_per_mm"]
+                    )
+                    if HOST_SOFTWARE_LIMITS_ENABLED and not (
+                        AXIS_TRAVEL_MIN_MM <= target_mm <= AXIS_TRAVEL_MAX_MM
+                    ):
+                        raise ValueError(
+                            f"축 {axis} 요청 목표 기계 위치 {target_mm:.3f} mm가 "
+                            f"소프트 리미트 {AXIS_TRAVEL_MIN_MM:g}~"
+                            f"{AXIS_TRAVEL_MAX_MM:g} mm를 벗어납니다."
+                        )
+                controller.start_six_axis_linear_interpolation(
+                    target_counts,
+                    motion_config["speed"],
+                    motion_config["acceleration_ms"],
+                    motion_config["deceleration_ms"],
+                )
+            else:
+                _, current_position_counts = self.read_position_feedback()
+                if current_position_counts is None:
+                    raise RuntimeError("현재 축 위치를 읽지 못했습니다.")
+                machine_position_mm = self.machine_position_mm_from_counts(
+                    current_position_counts,
+                    board_config["counts_per_mm"],
+                )
+                target_machine_position_mm = (
+                    machine_position_mm + motion_config["distance_mm"]
+                )
+                if HOST_SOFTWARE_LIMITS_ENABLED and not (
+                    AXIS_TRAVEL_MIN_MM
+                    <= target_machine_position_mm
+                    <= AXIS_TRAVEL_MAX_MM
+                ):
+                    raise ValueError(
+                        f"요청 목표 기계 위치 {target_machine_position_mm:.3f} mm가 "
+                        f"소프트 리미트 {AXIS_TRAVEL_MIN_MM:g}~"
+                        f"{AXIS_TRAVEL_MAX_MM:g} mm를 벗어납니다."
+                    )
+                target_counts[axes[0]] = current_position_counts + distance_counts
+                controller.move_relative(
+                    distance_counts,
+                    motion_config["speed"],
+                    motion_config["acceleration_ms"],
+                    motion_config["deceleration_ms"],
+                )
+            self.begin_position_batch_tracking(
+                axes,
+                "linear" if self.is_six_axis_batch_enabled() else "relative",
+                target_counts=target_counts,
             )
             self.position_motion_may_be_active = (
                 controller._motion_command_may_be_active
@@ -4432,7 +4819,13 @@ class ClampTestMachineApp(QMainWindow):
             )
             self.update_position_control_state()
             self.set_mr_status_text(
-                "MR-MC240N: relative move started "
+                "MR-MC240N: "
+                + (
+                    "axes 1-6 linked 3+3 interpolation "
+                    if len(axes) > 1
+                    else ""
+                )
+                + "relative move started "
                 f"({motion_config['distance_mm']:.4f} mm / {distance_counts} command units)"
             )
         except Exception as exc:
@@ -4442,11 +4835,27 @@ class ClampTestMachineApp(QMainWindow):
                 )
                 self.begin_position_motion_status_monitor()
                 self.update_position_control_state()
+            if not self.position_motion_may_be_active:
+                self.clear_position_batch_tracking()
             self.handle_position_command_error("Relative move", exc)
 
     def start_position_jog(self, direction):
+        # The held JOG button stays enabled to receive its release event;
+        # repeated presses must not send another start during active motion.
+        if (
+            self.position_jog_command_active
+            or self.position_motion_may_be_active
+            or self.is_test_running
+            or self.live_motion_cycle_active
+            or (
+                self.position_monitor is not None
+                and self.position_monitor._motion_command_may_be_active
+            )
+        ):
+            return
         direction_text = "+" if direction == MrMc240nPositionController.SSC_DIR_PLUS else "-"
         controller = None
+        batch_enabled = self.is_six_axis_batch_enabled()
         try:
             controller = self.get_position_controller(require_armed=True)
             if HOST_SOFTWARE_LIMITS_ENABLED:
@@ -4487,12 +4896,23 @@ class ClampTestMachineApp(QMainWindow):
                         f"상한 정지 여유 {stop_margin_mm:.3f} mm를 확보할 수 "
                         "없습니다. 속도/감속시간을 낮추거나 반대 방향으로 이동하세요."
                     )
-            controller.start_jog(
-                direction,
-                motion_config["speed"],
-                motion_config["acceleration_ms"],
-                motion_config["deceleration_ms"],
-            )
+            axes = self.get_position_command_axes()
+            if batch_enabled:
+                controller.start_jog_axes(
+                    direction,
+                    motion_config["speed"],
+                    motion_config["acceleration_ms"],
+                    motion_config["deceleration_ms"],
+                    axis_numbers=axes,
+                )
+            else:
+                controller.start_jog(
+                    direction,
+                    motion_config["speed"],
+                    motion_config["acceleration_ms"],
+                    motion_config["deceleration_ms"],
+                )
+            self.begin_position_batch_tracking(axes, "jog")
             self.position_jog_command_active = True
             self.position_jog_direction = direction
             self.position_motion_may_be_active = (
@@ -4500,13 +4920,19 @@ class ClampTestMachineApp(QMainWindow):
             )
             self.begin_position_motion_status_monitor()
             self.update_position_control_state()
-            self.set_mr_status_text(f"MR-MC240N: JOG {direction_text} running")
+            self.set_mr_status_text(
+                f"MR-MC240N: {'axes 1-6 ' if batch_enabled else ''}"
+                f"JOG {direction_text} running"
+            )
         except Exception as exc:
             if controller is not None:
                 automatic_stop_error = None
                 if controller._motion_command_may_be_active:
                     try:
-                        controller.stop_jog()
+                        if batch_enabled:
+                            controller.stop_jog_axes(axis_numbers=range(1, 7))
+                        else:
+                            controller.stop_jog()
                     except Exception as stop_exc:
                         automatic_stop_error = stop_exc
                         try:
@@ -4530,6 +4956,8 @@ class ClampTestMachineApp(QMainWindow):
             else:
                 self.position_jog_command_active = False
                 self.position_jog_direction = None
+            if not self.position_motion_may_be_active:
+                self.clear_position_batch_tracking()
             self.handle_position_command_error(f"JOG {direction_text}", exc)
 
     def stop_position_jog(self):
@@ -4545,10 +4973,16 @@ class ClampTestMachineApp(QMainWindow):
             return
         try:
             controller = self.get_position_controller(require_armed=False)
-            controller.stop_jog()
+            if len(self.position_active_axes) > 1:
+                controller.stop_jog_axes(
+                    axis_numbers=sorted(self.position_active_axes)
+                )
+            else:
+                controller.stop_jog()
             self.position_jog_command_active = False
             self.position_jog_direction = None
             self.position_motion_may_be_active = False
+            self.clear_position_batch_tracking()
             self.stop_position_motion_status_monitor()
             self.update_position_control_state()
             self.set_mr_status_text("MR-MC240N: JOG stopped")
@@ -4569,10 +5003,21 @@ class ClampTestMachineApp(QMainWindow):
         )
         try:
             controller = self.get_position_controller(require_armed=False)
-            stop_result = controller.stop(rapid=rapid)
+            batch_axes = sorted(self.position_active_axes)
+            if len(batch_axes) > 1 and self.position_jog_command_active:
+                stop_result = controller.stop_jog_axes(axis_numbers=batch_axes)
+            elif len(batch_axes) > 1:
+                stop_result = controller.stop_all_axes(
+                    axis_numbers=batch_axes,
+                    rapid=rapid,
+                    timeout_ms=3000,
+                )
+            else:
+                stop_result = controller.stop(rapid=rapid)
             self.position_jog_command_active = False
             self.position_jog_direction = None
             self.position_motion_may_be_active = False
+            self.clear_position_batch_tracking()
             self.stop_position_motion_status_monitor()
             self.update_position_control_state()
             stop_mode = (
@@ -4632,6 +5077,9 @@ class ClampTestMachineApp(QMainWindow):
             self.position_jog_command_active = False
             self.position_jog_direction = None
             self.position_motion_may_be_active = False
+            self.position_home_command_pending = False
+            self.position_home_pending_axes.clear()
+            self.clear_position_batch_tracking()
             self.stop_position_motion_status_monitor()
             if automatic_test_active:
                 self.live_motion_cycle_active = False
@@ -4693,7 +5141,14 @@ class ClampTestMachineApp(QMainWindow):
 
             for axis, label in enumerate(self.mr_axis_status_labels, start=1):
                 try:
-                    axis_status = controller.read_axis_status(axis)
+                    if len(self.position_active_axes) > 1 and isinstance(
+                        controller, MrMc240nPositionController
+                    ):
+                        axis_status = controller.read_axis_status(
+                            axis, track_motion=False
+                        )
+                    else:
+                        axis_status = controller.read_axis_status(axis)
                     raw_counts = int(axis_status["position"])
                     encoder_initializing = (
                         raw_counts == ENCODER_INITIAL_POSITION_COUNTS
@@ -4754,9 +5209,16 @@ class ClampTestMachineApp(QMainWindow):
                         f"{position_mm:.4f} mm ({raw_counts} cmd)"
                     )
 
+                    home_established = bool(
+                        axis_status.get("home_established", axis_status.get("home_complete", False))
+                    )
+                    if home_established:
+                        self.position_home_established_axes.add(axis)
+                    else:
+                        self.position_home_established_axes.discard(axis)
                     if axis == selected_axis:
-                        if axis_status.get("home_complete"):
-                            self.position_home_established = True
+                        self.position_home_established = home_established
+                        if home_established:
                             self.position_zero_offset_mm = 0.0
                         if (
                             not axis_status["operating"]
@@ -4784,7 +5246,9 @@ class ClampTestMachineApp(QMainWindow):
                                 ("servo_on", "SERVO-ON"),
                                 ("operating", "RUNNING"),
                                 ("in_position", "IN-POS"),
-                                ("home_complete", "HOME"),
+                                ("home_established", "HOMED"),
+                                ("home_complete", "HOME-DONE"),
+                                ("home_required", "HOME-REQUIRED"),
                                 ("servo_alarm", "SERVO-ALARM"),
                                 ("operation_alarm", "OP-ALARM"),
                                 ("servo_warning", "SERVO-WARNING"),
@@ -4983,52 +5447,167 @@ class ClampTestMachineApp(QMainWindow):
         }
 
     def validate_live_motion_axis(self, controller, motion_config):
-        axis_status = controller.read_axis_status()
-        if axis_status.get("servo_alarm") or axis_status.get("operation_alarm"):
-            raise RuntimeError("선택 축에 Servo/Operation alarm이 있습니다.")
-        if axis_status.get("operating"):
-            raise RuntimeError("선택 축이 이미 운전 중입니다.")
-        if not axis_status.get("servo_ready"):
-            raise RuntimeError(
-                "선택 축이 Servo Ready 상태가 아닙니다. Servo ON 후 다시 시작해주세요."
+        axes = self.get_position_command_axes()
+        batch_enabled = len(axes) > 1
+        statuses = {
+            axis: controller.read_axis_status(
+                axis, track_motion=False
             )
-        self.require_position_home_established(controller)
+            for axis in axes
+        } if batch_enabled else {axes[0]: controller.read_axis_status()}
 
-        raw_counts = int(axis_status["position"])
-        machine_position_mm = self.machine_position_mm_from_counts(
-            raw_counts,
-            motion_config["counts_per_mm"],
-        )
-        if HOST_SOFTWARE_LIMITS_ENABLED and not (
-            AXIS_TRAVEL_MIN_MM
-            <= machine_position_mm
-            <= AXIS_TRAVEL_MAX_MM
-        ):
-            raise RuntimeError(
-                f"현재 기계 위치 {machine_position_mm:.3f} mm가 소프트 리미트 "
-                f"{AXIS_TRAVEL_MIN_MM:g}~{AXIS_TRAVEL_MAX_MM:g} mm를 벗어납니다."
+        failures = []
+        positions_mm = {}
+        for axis, axis_status in statuses.items():
+            reasons = []
+            if axis_status.get("servo_alarm") or axis_status.get("operation_alarm"):
+                reasons.append("Servo/Operation alarm")
+            if axis_status.get("operating"):
+                reasons.append("already operating")
+            if not axis_status.get("servo_ready"):
+                reasons.append("Servo Ready is OFF")
+            if reasons:
+                failures.append(f"축 {axis}: {', '.join(reasons)}")
+                continue
+
+            raw_counts = int(axis_status["position"])
+            machine_position_mm = self.machine_position_mm_from_counts(
+                raw_counts, motion_config["counts_per_mm"]
             )
-        current_position_mm = (
-            raw_counts / motion_config["counts_per_mm"]
-        ) - self.position_zero_offset_mm
-        allowed_margin_mm = max(1.0, motion_config["stroke_span_mm"] * 0.05)
-        if not (
-            motion_config["minimum_mm"] - allowed_margin_mm
-            <= current_position_mm
-            <= motion_config["maximum_mm"] + allowed_margin_mm
-        ):
-            raise RuntimeError(
-                f"현재 위치 {current_position_mm:.3f} mm가 시험 범위 "
-                f"{motion_config['minimum_mm']:.3f}~{motion_config['maximum_mm']:.3f} mm에서 "
-                "너무 멉니다. 위치 영점 또는 시험 범위를 확인해주세요."
+            if HOST_SOFTWARE_LIMITS_ENABLED and not (
+                AXIS_TRAVEL_MIN_MM <= machine_position_mm <= AXIS_TRAVEL_MAX_MM
+            ):
+                failures.append(
+                    f"축 {axis}: 기계 위치 {machine_position_mm:.3f} mm가 "
+                    "소프트 리미트를 벗어남"
+                )
+                continue
+            current_position_mm = (
+                raw_counts / motion_config["counts_per_mm"]
+            ) - self.position_zero_offset_mm
+            positions_mm[axis] = current_position_mm
+            allowed_margin_mm = max(
+                1.0, motion_config["stroke_span_mm"] * 0.05
             )
-        return current_position_mm, raw_counts
+            if not (
+                motion_config["minimum_mm"] - allowed_margin_mm
+                <= current_position_mm
+                <= motion_config["maximum_mm"] + allowed_margin_mm
+            ):
+                failures.append(
+                    f"축 {axis}: 현재 위치 {current_position_mm:.3f} mm가 "
+                    f"시험 범위 {motion_config['minimum_mm']:.3f}~"
+                    f"{motion_config['maximum_mm']:.3f} mm에서 너무 멂"
+                )
+
+        if failures:
+            raise RuntimeError("; ".join(failures))
+        self.require_position_home_established(controller)
+        self.live_motion_positions_mm = positions_mm
+        reference_axis = controller.axis_number if controller.axis_number in axes else axes[0]
+        reference_status = statuses[reference_axis]
+        return positions_mm[reference_axis], int(reference_status["position"])
 
     def start_live_motion_move(self, target_mm, state, current_position_mm=None):
         controller = self.get_position_controller(require_armed=True)
         config = self.live_motion_config
         if config is None:
             raise RuntimeError("자동 왕복 시험 설정이 없습니다.")
+
+        if self.is_six_axis_batch_enabled():
+            axes = tuple(range(1, 7))
+            statuses = {
+                axis: controller.read_axis_status(axis, track_motion=False)
+                for axis in axes
+            }
+            positions_mm = {
+                axis: (
+                    int(status["position"]) / config["counts_per_mm"]
+                    - self.position_zero_offset_mm
+                )
+                for axis, status in statuses.items()
+            }
+            self.live_motion_positions_mm = positions_mm
+            distances_mm = {
+                axis: target_mm - position
+                for axis, position in positions_mm.items()
+            }
+            excessive = [
+                axis
+                for axis, distance in distances_mm.items()
+                if abs(distance) > (
+                    config["stroke_span_mm"]
+                    + max(1.0, config["tolerance_mm"] * 5)
+                )
+            ]
+            if excessive:
+                raise RuntimeError(
+                    "설정 Stroke 범위를 초과하는 이동 축: "
+                    + ", ".join(map(str, excessive))
+                )
+
+            self.test_state = state
+            self.live_motion_target_mm = target_mm
+            maximum_distance_mm = max(abs(value) for value in distances_mm.values())
+            expected_seconds = (
+                maximum_distance_mm / config["speed_mm_min"] * 60.0
+            )
+            self.live_motion_deadline = time.monotonic() + max(
+                10.0,
+                expected_seconds * 2.0
+                + (config["acceleration_ms"] + config["deceleration_ms"])
+                / 1000.0
+                + 5.0,
+            )
+            moving_axes = tuple(
+                axis
+                for axis in axes
+                if abs(distances_mm[axis]) > config["tolerance_mm"]
+            )
+            if not moving_axes:
+                self.clear_position_batch_tracking()
+                return
+            distance_counts = {
+                axis: round(distances_mm[axis] * config["counts_per_mm"])
+                for axis in axes
+            }
+            if any(
+                not POSITION_COMMAND_MIN <= value <= POSITION_COMMAND_MAX
+                for value in distance_counts.values()
+            ):
+                raise RuntimeError(
+                    "Automatic move command exceeds the MR-MC240N signed "
+                    "32-bit command-unit range."
+                )
+            target_counts = {
+                axis: int(statuses[axis]["position"]) + distance_counts[axis]
+                for axis in axes
+            }
+            try:
+                controller.start_six_axis_linear_interpolation(
+                    target_counts,
+                    config["speed_mm_min"],
+                    config["acceleration_ms"],
+                    config["deceleration_ms"],
+                )
+                self.begin_position_batch_tracking(
+                    axes, "linear", target_counts=target_counts
+                )
+            finally:
+                self.position_motion_may_be_active = (
+                    controller._motion_command_may_be_active
+                )
+                self.begin_position_motion_status_monitor(
+                    max(300.0, expected_seconds * 2.0 + 10.0)
+                )
+                self.update_position_control_state()
+            self.append_system_log(
+                f"{state}: axes 1-3/group 1 + axes 4-6/group 2 → "
+                f"{target_mm:.3f} mm ({config['speed_mm_min']} mm/min, "
+                "OAS-linked interpolation)",
+                "MR-MC240N",
+            )
+            return
 
         feedback_position_mm, raw_counts = self.read_position_feedback()
         if current_position_mm is None:
@@ -5179,26 +5758,68 @@ class ClampTestMachineApp(QMainWindow):
             return False
 
         controller = self.get_position_controller(require_armed=True)
-        axis_status = controller.read_axis_status()
-        if axis_status.get("servo_alarm") or axis_status.get("operation_alarm"):
-            raise RuntimeError("자동 왕복 중 Servo/Operation alarm이 발생했습니다.")
+        if self.is_six_axis_batch_enabled():
+            statuses = {
+                axis: controller.read_axis_status(axis, track_motion=False)
+                for axis in range(1, 7)
+            }
+            alarm_axes = [
+                axis
+                for axis, status in statuses.items()
+                if status.get("servo_alarm") or status.get("operation_alarm")
+            ]
+            if alarm_axes:
+                raise RuntimeError(
+                    "자동 왕복 중 Servo/Operation alarm 발생 축: "
+                    + ", ".join(map(str, alarm_axes))
+                )
+            self.live_motion_positions_mm = {
+                axis: (
+                    int(status["position"]) / config["counts_per_mm"]
+                    - self.position_zero_offset_mm
+                )
+                for axis, status in statuses.items()
+            }
+            reference_axis = (
+                controller.axis_number
+                if controller.axis_number in statuses
+                else 1
+            )
+            position_mm = self.live_motion_positions_mm[reference_axis]
+            target_reached = all(
+                abs(axis_position - self.live_motion_target_mm)
+                <= config["tolerance_mm"]
+                for axis_position in self.live_motion_positions_mm.values()
+            )
+            operation_finished = all(
+                not status.get("operating", False)
+                and (
+                    status.get("in_position", False)
+                    or status.get("operation_complete", False)
+                )
+                for status in statuses.values()
+            )
+        else:
+            axis_status = controller.read_axis_status()
+            if axis_status.get("servo_alarm") or axis_status.get("operation_alarm"):
+                raise RuntimeError("자동 왕복 중 Servo/Operation alarm이 발생했습니다.")
+            target_reached = (
+                abs(position_mm - self.live_motion_target_mm)
+                <= config["tolerance_mm"]
+            )
+            operation_finished = (
+                not axis_status.get("operating", False)
+                and (
+                    axis_status.get("in_position", False)
+                    or axis_status.get("operation_complete", False)
+                )
+            )
         if now > self.live_motion_deadline:
             raise TimeoutError(
                 f"{self.test_state} 제한시간을 초과했습니다 "
                 f"(현재 {position_mm:.3f} mm / 목표 {self.live_motion_target_mm:.3f} mm)."
             )
 
-        target_reached = (
-            abs(position_mm - self.live_motion_target_mm)
-            <= config["tolerance_mm"]
-        )
-        operation_finished = (
-            not axis_status.get("operating", False)
-            and (
-                axis_status.get("in_position", False)
-                or axis_status.get("operation_complete", False)
-            )
-        )
         if not (target_reached and operation_finished):
             return False
 
@@ -5402,6 +6023,7 @@ class ClampTestMachineApp(QMainWindow):
             load_values = list(measurement.get("values") or [load_value] * 6)
             live_stable = measurement["stable"]
             live_voltage = measurement["voltage"]
+            self.update_daq_measurement_status(measurement)
         except Exception as exc:
             self.stop_test(completed=False)
             self.append_system_log(f"하중 읽기 실패: {exc}", "FC400")
@@ -5563,7 +6185,7 @@ class ClampTestMachineApp(QMainWindow):
             )
         else:
             self.lbl_status.setText(
-                f"Status: LIVE ({source_name} {current_calibrated_display[0]:.2f} {self.unit}, 6채널 동일)"
+                f"Status: LIVE ({source_name} {current_calibrated_display[0]:.2f} {self.unit}, 6채널 수집)"
             )
 
     def timer_step(self):
@@ -5605,7 +6227,7 @@ class ClampTestMachineApp(QMainWindow):
         self.update_table_headers()
         self.update_table()
         self.update_chart(reset_scale=True)
-        if self.review_slider.isEnabled():
+        if self.review_selected_data_index is not None:
             self.on_review_slider_changed(self.review_slider.value())
 
     def zero_sensors(self):
@@ -5650,6 +6272,7 @@ class ClampTestMachineApp(QMainWindow):
 
         self.raw_data = current_values
         self.sensor_zeros = self.raw_data.copy()
+        self.update_daq_measurement_status(measurement)
         message_text = "로드셀 영점(Tare) 및 이전 데이터 초기화가 완료되었습니다."
 
         if self.is_position_pcie_enabled():
@@ -5681,6 +6304,12 @@ class ClampTestMachineApp(QMainWindow):
                 (1, f"{raw_display:.2f}"),
                 (2, f"{zero_display:.2f}"),
                 (3, f"{calibrated_display:.2f}"),
+                (4, (
+                    f"{self.latest_daq_voltages[i]:.5f}"
+                    if i < len(self.latest_daq_voltages)
+                    and self.latest_daq_voltages[i] is not None
+                    else "--"
+                )),
             ):
                 item = self.table.item(i, column)
                 if item is None:
@@ -5818,11 +6447,27 @@ class ClampTestMachineApp(QMainWindow):
             or controller_motion_may_be_active
         )
         motion_stop_confirmed = not motion_was_uncertain
+        stop_all_test_axes = (
+            len(self.position_active_axes) > 1
+            or (was_live_motion_test and self.is_six_axis_batch_enabled())
+            or getattr(self.position_monitor, "_motion_kind", "").startswith("batch_")
+        )
 
         if (
             motion_was_uncertain
             and self.position_monitor is not None
         ):
+            if stop_all_test_axes:
+                # Retain both groups for close/cleanup retries until the
+                # complete six-axis stop is confirmed.
+                self.position_active_axes.update(range(1, 7))
+                stop_motion = self.position_monitor.stop_all_axes
+                stop_kwargs = {"axis_numbers": range(1, 7)}
+                stop_target = "axes 1-6 (groups 1+2)"
+            else:
+                stop_motion = self.position_monitor.stop
+                stop_kwargs = {}
+                stop_target = "selected axis"
             if self.load_limit_tripped:
                 try:
                     self.position_monitor.stop_all_axes(
@@ -5845,34 +6490,41 @@ class ClampTestMachineApp(QMainWindow):
                     )
             else:
                 try:
-                    self.position_monitor.stop(
+                    stop_result = stop_motion(
                         rapid=False,
                         timeout_ms=3000,
+                        **stop_kwargs,
                     )
                     motion_stop_confirmed = True
+                    stop_mode = (
+                        stop_result.get("mode", "deceleration stop")
+                        if isinstance(stop_result, dict)
+                        else "deceleration stop"
+                    )
                     self.append_system_log(
-                        "Automatic test stop command sent",
+                        f"Automatic test {stop_target} stop confirmed via {stop_mode}",
                         "MR-MC240N",
                     )
                 except Exception as exc:
                     self.append_system_log(
-                        f"Automatic test normal stop failed: {exc}",
+                        f"Automatic test {stop_target} normal stop failed: {exc}",
                         "MR-MC240N",
                     )
                     try:
-                        self.position_monitor.stop(
+                        stop_motion(
                             rapid=True,
                             timeout_ms=3000,
+                            **stop_kwargs,
                         )
                         motion_stop_confirmed = True
                         self.append_system_log(
-                            "Automatic test rapid stop command sent",
+                            f"Automatic test {stop_target} rapid stop confirmed",
                             "MR-MC240N",
                         )
                     except Exception as rapid_exc:
                         motion_stop_confirmed = False
                         self.append_system_log(
-                            f"Automatic test rapid stop failed: {rapid_exc}",
+                            f"Automatic test {stop_target} rapid stop failed: {rapid_exc}",
                             "MR-MC240N",
                         )
         if motion_stop_confirmed:
@@ -5890,7 +6542,9 @@ class ClampTestMachineApp(QMainWindow):
         self.update_position_control_state()
         self.update_start_button_idle_state()
 
-        self.close_ni_daq_task()
+        if not self.daq_live_enabled:
+            self.close_ni_daq_task()
+            self.lbl_daq_live.setText("DAQ 정지 · 마지막 수신값")
         self.close_position_monitor()
         self.ensure_export_snapshot()
         if was_live_motion_test and completed:
@@ -6358,13 +7012,14 @@ class ClampTestMachineApp(QMainWindow):
         ax_remark.add_patch(rect)
 
         # 방사형 그래프
-        ax_graph = fig.add_axes([0.25, 0.06, 0.5, 0.32], polar=True)
+        # Reserve space for the title below the report's Remark section.
+        ax_graph = fig.add_axes([0.25, 0.06, 0.5, 0.29], polar=True)
         data = final_data
         angles = np.linspace(0, 2 * np.pi, 6, endpoint=False)
         plot_data = data + [data[0]]
         angles_plot = np.append(angles, angles[0])
 
-        ax_graph.set_theta_offset(np.pi / 2)
+        ax_graph.set_theta_offset(LOAD_CHART_THETA_OFFSET_RAD)
         ax_graph.set_theta_direction(-1)
         ax_graph.set_xticks(angles)
         ax_graph.set_xticklabels(['Axis 1', 'Axis 2', 'Axis 3', 'Axis 4', 'Axis 5', 'Axis 6'], fontproperties=font_prop, fontsize=9)
@@ -6387,8 +7042,7 @@ class ClampTestMachineApp(QMainWindow):
             ax_graph.fill(angles_plot, plot_data, 'b', alpha=0.15)
 
         ax_graph.scatter(angles, data, color='red', s=40, zorder=5)
-        ax_graph.set_ylabel(f'Load [{report_unit}]', labelpad=25, fontproperties=font_prop, fontsize=9)
-        ax_graph.set_title('Final Load Distribution (6-Axis)', pad=15, fontproperties=font_prop, fontsize=11, weight='bold')
+        ax_graph.set_title(f'Final Load Distribution (6-Axis) / Load [{report_unit}]', pad=15, fontproperties=font_prop, fontsize=11, weight='bold')
         ax_graph.grid(True, linestyle='--', alpha=0.7)
         return fig
 
@@ -6457,6 +7111,9 @@ class ClampTestMachineApp(QMainWindow):
         )
 
     def closeEvent(self, event):
+        resume_daq_live = self.daq_live_enabled
+        self.daq_live_enabled = False
+        self.daq_live_timer.stop()
         self.close_camera(reset_status=False)
         if self.is_test_running:
             self.stop_test(completed=False)
@@ -6472,6 +7129,8 @@ class ClampTestMachineApp(QMainWindow):
                 "확인한 뒤 Rapid Stop/Connect를 다시 시도하세요.",
             )
             event.ignore()
+            if resume_daq_live:
+                self.start_daq_live_monitor()
             return
         super().closeEvent(event)
 
@@ -6495,4 +7154,5 @@ if __name__ == '__main__':
     app = QApplication(sys.argv)
     ex = ClampTestMachineApp()
     ex.showMaximized()
+    ex.start_daq_live_monitor()
     sys.exit(app.exec_())

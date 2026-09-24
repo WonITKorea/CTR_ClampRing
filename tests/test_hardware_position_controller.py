@@ -29,6 +29,14 @@ def fake_vendor_library():
         )
         return 0
 
+    def write_jog_stopped(_board_id, _channel, _axis_number, status_pointer):
+        status_pointer._obj.value = MrMc240nPositionController.SSC_BIT_OFF
+        return 0
+
+    def write_drive_stopped(_board_id, _channel, _axis_number, status_pointer):
+        status_pointer._obj.value = MrMc240nPositionController.SSC_DRIVE_FIN
+        return 0
+
     return SimpleNamespace(
         sscOpen=Mock(name="sscOpen", return_value=0),
         sscClose=Mock(name="sscClose", return_value=0),
@@ -62,9 +70,24 @@ def fake_vendor_library():
         ),
         sscJogStart=Mock(name="sscJogStart", return_value=0),
         sscJogStop=Mock(name="sscJogStop", return_value=0),
+        sscJogStopNoWait=Mock(
+            name="sscJogStopNoWait", side_effect=write_jog_stopped
+        ),
         sscIncStart=Mock(name="sscIncStart", return_value=0),
+        sscSetPointDataEx=Mock(name="sscSetPointDataEx", return_value=0),
+        sscSetOtherAxisStartData=Mock(
+            name="sscSetOtherAxisStartData", return_value=0
+        ),
+        sscGetOtherAxisStartStatus=Mock(
+            name="sscGetOtherAxisStartStatus", return_value=0
+        ),
+        sscSetDriveMode=Mock(name="sscSetDriveMode", return_value=0),
+        sscLinearStart=Mock(name="sscLinearStart", return_value=0),
         sscHomeReturnStart=Mock(name="sscHomeReturnStart", return_value=0),
         sscDriveStop=Mock(name="sscDriveStop", return_value=0),
+        sscDriveStopNoWait=Mock(
+            name="sscDriveStopNoWait", side_effect=write_drive_stopped
+        ),
         sscDriveRapidStop=Mock(name="sscDriveRapidStop", return_value=0),
         sscOperationAlarmReset=Mock(name="sscOperationAlarmReset", return_value=0),
         sscServoAlarmReset=Mock(name="sscServoAlarmReset", return_value=0),
@@ -106,6 +129,7 @@ class PositionBoardProjectTests(unittest.TestCase):
                     "0X0242",
                     "0X0243",
                     "0X024C",
+                    "0X0260",
                     "0X1100",
                     "0X1103",
                 ):
@@ -137,10 +161,10 @@ class PositionBoardProjectTests(unittest.TestCase):
         )
         self.assertEqual(software_lower_limit, 0)
         self.assertEqual(software_upper_limit, 0)
-        # Minus-direction dog home with an NO DOG input, 500/50 mm/min.
+        # Minus-direction dog-cradle home with an NO DOG input, 500/100 mm/min.
         self.assertEqual(
             [axis_mapping[axis]["0X0240"] for axis in range(1, 7)],
-            [0x0100] * 6,
+            [0x0104] * 6,
         )
         self.assertEqual(
             [
@@ -152,7 +176,11 @@ class PositionBoardProjectTests(unittest.TestCase):
         )
         self.assertEqual(
             [axis_mapping[axis]["0X024C"] for axis in range(1, 7)],
-            [50] * 6,
+            [100] * 6,
+        )
+        self.assertEqual(
+            [axis_mapping[axis]["0X0260"] for axis in range(1, 7)],
+            [1, 1, 1, 2, 2, 2],
         )
         self.assertEqual(axis_mapping[1]["0X1100"], 0x1000)
         # MR-J4 PA04.2=1: disable the amplifier EM2/EM1 forced-stop input.
@@ -168,6 +196,10 @@ class PositionBoardProjectTests(unittest.TestCase):
 
 
 class PositionControllerConstantTests(unittest.TestCase):
+    def test_vendor_interpolation_structures_match_installed_header_sizes(self):
+        self.assertEqual(ctypes.sizeof(hardware.MrMc240nPointDataEx), 0x20)
+        self.assertEqual(ctypes.sizeof(hardware.MrMc240nOtherAxisStartData), 0x68)
+
     def test_alarm_reset_calls_vendor_operation_and_servo_reset(self):
         library = fake_vendor_library()
         controller = MrMc240nPositionController(board_id=2, axis_number=4)
@@ -222,6 +254,7 @@ class PositionControllerConstantTests(unittest.TestCase):
             "SSC_STSBIT_AX_DSTO": 791,
             "SSC_STSBIT_AX_ISTP": 801,
             "SSC_STSBIT_AX_STO": 804,
+            "SSC_STSBIT_AX_ZREQ": 807,
         }
 
         for name, value in expected.items():
@@ -272,7 +305,7 @@ class PositionControllerConstantTests(unittest.TestCase):
         controller.get_axis_status_bit = Mock(
             side_effect=[
                 True, False, False, True, False, False, True,
-                False, False, True, False, False, False,
+                False, False, True, False, False, False, False,
             ]
         )
         controller.read_feedback_position_counts = Mock(return_value=12_345)
@@ -295,11 +328,32 @@ class PositionControllerConstantTests(unittest.TestCase):
                 call(791, 4),
                 call(801, 4),
                 call(804, 4),
+                call(807, 4),
             ],
         )
         controller.read_feedback_position_counts.assert_called_once_with(4)
         self.assertEqual(status["axis"], 4)
         self.assertEqual(status["position"], 12_345)
+
+    def test_home_reference_uses_zreq_and_encoder_status_not_transient_zp(self):
+        controller = MrMc240nPositionController(board_id=0, axis_number=1)
+        controller.read_feedback_position_counts = Mock(return_value=50_000)
+        for zp, zreq, encoder_error, established in (
+            (True, False, False, True),
+            (False, False, False, True),
+            (False, True, False, False),
+            (True, True, False, False),
+            (True, False, True, False),
+        ):
+            with self.subTest(zp=zp, zreq=zreq, encoder_error=encoder_error):
+                signals = {780: zp, 807: zreq, 776: encoder_error}
+                controller.get_axis_status_bit = Mock(
+                    side_effect=lambda bit, _axis: signals.get(bit, False)
+                )
+                status = controller.read_axis_status(track_motion=False)
+                self.assertEqual(status["home_complete"], zp)
+                self.assertEqual(status["home_required"], zreq)
+                self.assertEqual(status["home_established"], established)
 
     def test_stale_operation_complete_does_not_clear_motion_latch(self):
         controller = MrMc240nPositionController(board_id=2, axis_number=4)
@@ -312,13 +366,13 @@ class PositionControllerConstantTests(unittest.TestCase):
             side_effect=[
                 # Stale pre-command status: OP=0, OPF=1.
                 True, False, False, False, False, False, True,
-                False, False, True, False, False, False,
+                False, False, True, False, False, False, False,
                 # Command has visibly entered operation.
                 True, False, False, True, False, False, False,
-                False, False, True, False, False, False,
+                False, False, True, False, False, False, False,
                 # Completion after OP was observed.
                 True, True, False, False, False, False, True,
-                False, False, True, False, False, False,
+                False, False, True, False, False, False, False,
             ]
         )
         controller.read_feedback_position_counts = Mock(return_value=12_345)
@@ -344,7 +398,7 @@ class PositionControllerConstantTests(unittest.TestCase):
         controller.get_axis_status_bit = Mock(
             side_effect=[
                 True, True, False, False, False, False, True,
-                False, False, True, False, False, False,
+                False, False, True, False, False, False, False,
             ]
         )
         controller.read_feedback_position_counts = Mock(return_value=12_346)
@@ -363,7 +417,7 @@ class PositionControllerConstantTests(unittest.TestCase):
         controller.get_axis_status_bit = Mock(
             side_effect=[
                 True, True, False, False, True, False, True,
-                False, False, True, False, False, False,
+                False, False, True, False, False, False, False,
             ]
         )
         controller.read_feedback_position_counts = Mock(return_value=0)
@@ -381,7 +435,7 @@ class PositionControllerConstantTests(unittest.TestCase):
         controller.get_axis_status_bit = Mock(
             side_effect=[
                 True, True, False, False, False, False, True,
-                False, False, True, False, False, False,
+                False, False, True, False, False, False, False,
             ]
         )
         controller.read_feedback_position_counts = Mock(return_value=12_346)
@@ -392,6 +446,328 @@ class PositionControllerConstantTests(unittest.TestCase):
 
 
 class PositionControllerApiSignatureTests(unittest.TestCase):
+    def test_three_round_trips_work_after_zp_clears_but_zreq_stays_off(self):
+        controller = MrMc240nPositionController(board_id=0, axis_number=1)
+        library = fake_vendor_library()
+        controller.library = library
+        controller._is_open = True
+        state = {"position": 0, "zp": True, "invalid_axis": None}
+
+        def read_bits(_board, _channel, axis, bit, result):
+            signals = {
+                controller.SSC_STSBIT_AX_RDY: True,
+                controller.SSC_STSBIT_AX_INP: True,
+                controller.SSC_STSBIT_AX_OPF: True,
+                controller.SSC_STSBIT_AX_ZP: state["zp"],
+                controller.SSC_STSBIT_AX_ZREQ: axis == state["invalid_axis"],
+            }
+            result._obj.value = int(signals.get(bit, False))
+            return 0
+
+        def read_position(_board, _channel, _axis, result):
+            result._obj.value = state["position"]
+            return 0
+
+        library.sscGetStatusBitSignalEx.side_effect = read_bits
+        library.sscGetCurrentFbPositionFast.side_effect = read_position
+        for _stroke in range(3):
+            for target in (50_000, 0):
+                controller.start_six_axis_linear_interpolation(
+                    {axis: target for axis in range(1, 7)}, 100, 500, 500
+                )
+                # The board clears ZP at the next start/mode change; finishing
+                # a normal move must not be mistaken for losing the origin.
+                state.update(position=target, zp=False)
+                controller._clear_motion_latch()
+
+        self.assertEqual(library.sscLinearStart.call_count, 6)
+        self.assertEqual(library.sscSetPointDataEx.call_count, 36)
+
+        # Re-homing really becomes necessary: a stale ZP must not override it.
+        state.update(zp=True, invalid_axis=5)
+        with self.assertRaisesRegex(RuntimeError, "Not homed: 5"):
+            controller.start_six_axis_linear_interpolation(
+                {axis: 50_000 for axis in range(1, 7)}, 100, 500, 500
+            )
+        self.assertEqual(library.sscLinearStart.call_count, 6)
+        self.assertEqual(library.sscSetPointDataEx.call_count, 36)
+
+    def test_unreadable_zreq_blocks_interpolation_before_any_writes(self):
+        controller = MrMc240nPositionController(board_id=0, axis_number=1)
+        library = fake_vendor_library()
+        controller.library = library
+        controller._is_open = True
+
+        def read_bits(_board, _channel, _axis, bit, result):
+            if bit == controller.SSC_STSBIT_AX_ZREQ:
+                return -1
+            result._obj.value = int(bit == controller.SSC_STSBIT_AX_RDY)
+            return 0
+
+        library.sscGetStatusBitSignalEx.side_effect = read_bits
+        with self.assertRaisesRegex(RuntimeError, "status read failed"):
+            controller.start_six_axis_linear_interpolation(
+                {axis: 50_000 for axis in range(1, 7)}, 100, 500, 500
+            )
+        library.sscSetPointDataEx.assert_not_called()
+        library.sscLinearStart.assert_not_called()
+
+    def test_linked_interpolation_writes_two_groups_and_has_one_host_start(self):
+        controller = MrMc240nPositionController(board_id=2, axis_number=1)
+        library = fake_vendor_library()
+        controller.library = library
+        controller._is_open = True
+        axes = tuple(range(1, 7))
+        statuses = {
+            axis: {
+                "position": 0,
+                "servo_ready": True,
+                "home_complete": True,
+                "home_established": True,
+            }
+            for axis in axes
+        }
+        controller._preflight_motion_axes = Mock(return_value=(axes, statuses))
+
+        result = controller.start_six_axis_linear_interpolation(
+            {axis: 1_000 for axis in axes},
+            100,
+            50,
+            60,
+        )
+
+        self.assertEqual(library.sscSetPointDataEx.call_count, 6)
+        self.assertEqual(
+            [args.args[:4] for args in library.sscSetPointDataEx.call_args_list],
+            [(2, 1, axis, 0) for axis in axes],
+        )
+        points = {
+            args.args[2]: args.args[4]._obj
+            for args in library.sscSetPointDataEx.call_args_list
+        }
+        for axis in axes:
+            self.assertEqual(points[axis].position, 1_000)
+            self.assertEqual(points[axis].speed, 174)
+            self.assertEqual(points[axis].actime, 50)
+            self.assertEqual(points[axis].dctime, 60)
+            self.assertEqual(
+                points[axis].subcmd,
+                controller.SSC_SUBCMD_POS_ABS | controller.SSC_SUBCMD_STOP_SMZ,
+            )
+        self.assertEqual(list(points[1].oas_num), [1, 0])
+        for axis in range(2, 7):
+            self.assertEqual(list(points[axis].oas_num), [0, 0])
+
+        library.sscSetOtherAxisStartData.assert_called_once()
+        oas_call = library.sscSetOtherAxisStartData.call_args
+        self.assertEqual(oas_call.args[:3], (2, 1, 1))
+        oas_data = oas_call.args[3]._obj
+        self.assertEqual(oas_data.opt_own, controller.SSC_OAS_OWN_REMAINING_DISTANCE)
+        self.assertEqual(oas_data.opt_observ, controller.SSC_OAS_OBSERV_DISABLE)
+        self.assertEqual(oas_data.data_own, 2_147_483_647)
+        self.assertEqual(oas_data.st_axbit, 1 << 3)
+        self.assertEqual((oas_data.st_pnt_s, oas_data.st_pnt_e), (0, 0))
+
+        self.assertEqual(
+            library.sscSetDriveMode.call_args_list,
+            [call(2, 1, axis, controller.SSC_DRV_MODE_LINEAR) for axis in axes],
+        )
+        library.sscLinearStart.assert_called_once_with(2, 1, 1, 1, 0, 0)
+        library.sscIncStart.assert_not_called()
+        self.assertEqual(result["group_speeds"], {1: 174, 2: 174})
+        self.assertTrue(controller._motion_command_may_be_active)
+        self.assertEqual(controller._motion_kind, "batch_linear")
+
+    def test_linked_interpolation_scales_each_group_for_same_duration(self):
+        controller = MrMc240nPositionController(board_id=2, axis_number=1)
+        library = fake_vendor_library()
+        controller.library = library
+        controller._is_open = True
+        axes = tuple(range(1, 7))
+        statuses = {
+            axis: {
+                "position": 0,
+                "servo_ready": True,
+                "home_complete": True,
+                "home_established": True,
+            }
+            for axis in axes
+        }
+        controller._preflight_motion_axes = Mock(return_value=(axes, statuses))
+
+        result = controller.start_six_axis_linear_interpolation(
+            {1: 1_000, 2: 0, 3: 0, 4: 500, 5: 0, 6: 0},
+            100,
+            50,
+            50,
+        )
+
+        self.assertEqual(result["group_speeds"], {1: 100, 2: 50})
+
+    def test_linked_interpolation_rejects_unhomed_axis_before_writes(self):
+        controller = MrMc240nPositionController(board_id=2, axis_number=1)
+        library = fake_vendor_library()
+        controller.library = library
+        controller._is_open = True
+        axes = tuple(range(1, 7))
+        statuses = {
+            axis: {
+                "position": 0,
+                "servo_ready": True,
+                "home_complete": axis != 5,
+                "home_established": axis != 5,
+            }
+            for axis in axes
+        }
+        controller._preflight_motion_axes = Mock(return_value=(axes, statuses))
+
+        with self.assertRaisesRegex(RuntimeError, "Not homed: 5"):
+            controller.start_six_axis_linear_interpolation(
+                {axis: 1_000 for axis in axes}, 100, 50, 50
+            )
+
+        library.sscSetPointDataEx.assert_not_called()
+        library.sscSetOtherAxisStartData.assert_not_called()
+        library.sscSetDriveMode.assert_not_called()
+        library.sscLinearStart.assert_not_called()
+
+    def test_linked_interpolation_rejects_board_movement_limit_before_writes(self):
+        controller = MrMc240nPositionController(board_id=2, axis_number=1)
+        library = fake_vendor_library()
+        controller.library = library
+        controller._is_open = True
+        axes = tuple(range(1, 7))
+        statuses = {
+            axis: {
+                "position": 0,
+                "servo_ready": True,
+                "home_complete": True,
+                "home_established": True,
+            }
+            for axis in axes
+        }
+        controller._preflight_motion_axes = Mock(return_value=(axes, statuses))
+
+        with self.assertRaisesRegex(ValueError, "999999999-command-unit limit"):
+            controller.start_six_axis_linear_interpolation(
+                {axis: 1_000_000_000 for axis in axes}, 100, 50, 50
+            )
+
+        library.sscSetPointDataEx.assert_not_called()
+        library.sscLinearStart.assert_not_called()
+
+    def test_linked_interpolation_start_failure_force_stops_all_axes(self):
+        controller = MrMc240nPositionController(board_id=2, axis_number=1)
+        library = fake_vendor_library()
+        library.sscLinearStart.return_value = -1
+        library.sscGetLastError.return_value = 0x00010000
+        controller.library = library
+        controller._is_open = True
+        axes = tuple(range(1, 7))
+        statuses = {
+            axis: {
+                "position": 0,
+                "servo_ready": True,
+                "home_complete": True,
+                "home_established": True,
+            }
+            for axis in axes
+        }
+        controller._preflight_motion_axes = Mock(return_value=(axes, statuses))
+
+        def confirm_all_axis_stop(**_kwargs):
+            controller._clear_motion_latch()
+            return {"mode": "software forced stop"}
+
+        controller.stop_all_axes = Mock(side_effect=confirm_all_axis_stop)
+
+        with self.assertRaisesRegex(RuntimeError, "all requested axes were force-stopped"):
+            controller.start_six_axis_linear_interpolation(
+                {axis: 1_000 for axis in axes}, 100, 50, 50
+            )
+
+        controller.stop_all_axes.assert_called_once_with(
+            axis_numbers=axes, rapid=True, timeout_ms=3000
+        )
+        self.assertFalse(controller._motion_command_may_be_active)
+
+    def test_six_axis_relative_move_preflights_then_dispatches_every_axis(self):
+        controller = MrMc240nPositionController(board_id=2, axis_number=1)
+        library = fake_vendor_library()
+        controller.library = library
+        controller._is_open = True
+        axes = tuple(range(1, 7))
+        statuses = {
+            axis: {"position": axis * 100, "servo_ready": True}
+            for axis in axes
+        }
+        controller._preflight_motion_axes = Mock(
+            return_value=(axes, statuses)
+        )
+
+        controller.move_relative_axes(
+            {axis: axis * 1_000 for axis in axes},
+            500,
+            100,
+            100,
+        )
+
+        self.assertEqual(
+            library.sscIncStart.call_args_list,
+            [
+                call(2, 1, axis, axis * 1_000, 500, 100, 100)
+                for axis in axes
+            ],
+        )
+        self.assertTrue(controller._motion_command_may_be_active)
+        self.assertEqual(controller._motion_kind, "batch_relative")
+
+    def test_partial_six_axis_dispatch_force_stops_all_axes(self):
+        controller = MrMc240nPositionController(board_id=2, axis_number=1)
+        library = fake_vendor_library()
+        library.sscIncStart.side_effect = [0, 0, -1]
+        library.sscGetLastError.return_value = 0x00010000
+        controller.library = library
+        controller._is_open = True
+        axes = tuple(range(1, 7))
+        statuses = {axis: {"position": 0} for axis in axes}
+        controller._preflight_motion_axes = Mock(
+            return_value=(axes, statuses)
+        )
+
+        def confirm_all_axis_stop(**_kwargs):
+            controller._clear_motion_latch()
+            return {"mode": "software forced stop"}
+
+        controller.stop_all_axes = Mock(side_effect=confirm_all_axis_stop)
+
+        with self.assertRaisesRegex(RuntimeError, "all requested axes were force-stopped"):
+            controller.move_relative_axes(1_000, 500, 100, 100)
+
+        self.assertEqual(library.sscIncStart.call_count, 3)
+        controller.stop_all_axes.assert_called_once_with(
+            axis_numbers=axes, rapid=True, timeout_ms=3000
+        )
+        self.assertFalse(controller._motion_command_may_be_active)
+
+    def test_six_axis_jog_stop_attempts_every_axis(self):
+        controller = MrMc240nPositionController(board_id=2, axis_number=1)
+        library = fake_vendor_library()
+        controller.library = library
+        controller._is_open = True
+        controller._jog_active = True
+        controller._motion_command_may_be_active = True
+
+        result = controller.stop_jog_axes()
+
+        self.assertEqual(
+            [entry.args[:3] for entry in library.sscJogStopNoWait.call_args_list],
+            [(2, 1, axis) for axis in range(1, 7)],
+        )
+        library.sscJogStop.assert_not_called()
+        self.assertEqual(result["mode"], "coordinated JOG stop")
+        self.assertFalse(controller._motion_command_may_be_active)
+
     def test_motion_is_not_dispatched_when_axis_alarm_is_active(self):
         controller = MrMc240nPositionController(board_id=2, axis_number=6)
         library = fake_vendor_library()
@@ -452,6 +828,24 @@ class PositionControllerApiSignatureTests(unittest.TestCase):
             [ctypes.c_int, ctypes.c_int, ctypes.c_int],
         )
         self.assertIs(library.sscJogStop.restype, ctypes.c_int)
+        self.assertEqual(
+            library.sscJogStopNoWait.argtypes,
+            [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_short),
+            ],
+        )
+        self.assertEqual(
+            library.sscDriveStopNoWait.argtypes,
+            [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_short),
+            ],
+        )
 
     def test_stop_jog_passes_only_board_channel_and_axis(self):
         controller = MrMc240nPositionController(board_id=2, axis_number=6)
@@ -506,6 +900,68 @@ class PositionControllerApiSignatureTests(unittest.TestCase):
         library.sscDriveRapidStop.assert_not_called()
         self.assertEqual(result["mode"], "software forced stop")
         self.assertFalse(controller._jog_active)
+        self.assertFalse(controller._motion_command_may_be_active)
+
+    def test_linked_linear_stop_dispatches_both_groups_before_polling(self):
+        controller = MrMc240nPositionController(board_id=2, axis_number=1)
+        library = fake_vendor_library()
+        call_counts = {}
+        dispatch_order = []
+
+        def stop_group(_board_id, _channel, axis_number, status_pointer):
+            dispatch_order.append(axis_number)
+            call_counts[axis_number] = call_counts.get(axis_number, 0) + 1
+            status_pointer._obj.value = int(call_counts[axis_number] >= 2)
+            return 0
+
+        library.sscDriveStopNoWait.side_effect = stop_group
+        controller.library = library
+        controller._is_open = True
+        controller._motion_kind = "batch_linear"
+        controller._motion_command_may_be_active = True
+
+        result = controller.stop_all_axes(rapid=False)
+
+        self.assertEqual(dispatch_order[:2], [1, 4])
+        self.assertEqual(set(dispatch_order), {1, 4})
+        library.sscDriveStop.assert_not_called()
+        self.assertEqual(result["mode"], "linked linear deceleration stop")
+        self.assertFalse(result["escalated"])
+        self.assertFalse(controller._motion_command_may_be_active)
+
+    def test_linked_linear_stop_failure_escalates_to_system_semi(self):
+        controller = MrMc240nPositionController(board_id=2, axis_number=1)
+        library = fake_vendor_library()
+
+        def stop_group(_board_id, _channel, axis_number, status_pointer):
+            status_pointer._obj.value = controller.SSC_DRIVE_FIN
+            return -1 if axis_number == 4 else 0
+
+        def write_system_bits(
+            _board_id, _channel, _axis, bit_number, status_pointer
+        ):
+            status_pointer._obj.value = int(
+                bit_number == controller.SSC_STSBIT_SYS_EMIO
+            )
+            return 0
+
+        library.sscDriveStopNoWait.side_effect = stop_group
+        library.sscGetStatusBitSignalEx.side_effect = write_system_bits
+        library.sscGetLastError.return_value = 0x00010000
+        controller.library = library
+        controller._is_open = True
+        controller._motion_kind = "batch_linear"
+        controller._motion_command_may_be_active = True
+
+        result = controller.stop_all_axes(rapid=False)
+
+        self.assertEqual(
+            [entry.args[2] for entry in library.sscDriveStopNoWait.call_args_list],
+            [1, 4],
+        )
+        library.sscSetCommandBitSignalEx.assert_called_once_with(2, 1, 0, 17, 1)
+        self.assertEqual(result["mode"], "software forced stop")
+        self.assertTrue(result["escalated"])
         self.assertFalse(controller._motion_command_may_be_active)
 
     def test_failed_motion_dispatch_remains_latched_until_stop_succeeds(self):

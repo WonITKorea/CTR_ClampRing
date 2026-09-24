@@ -1,10 +1,12 @@
 import ctypes
 import json
+import math
 import os
 import re
 import struct
 import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
@@ -38,13 +40,61 @@ MR_MC240N_REQUIRED_API_EXPORTS = (
     "sscGetStatusBitSignalEx",
     "sscJogStart",
     "sscJogStop",
+    "sscJogStopNoWait",
     "sscIncStart",
+    "sscSetPointDataEx",
+    "sscSetOtherAxisStartData",
+    "sscGetOtherAxisStartStatus",
+    "sscSetDriveMode",
+    "sscLinearStart",
     "sscHomeReturnStart",
     "sscDriveStop",
+    "sscDriveStopNoWait",
     "sscDriveRapidStop",
     "sscOperationAlarmReset",
     "sscServoAlarmReset",
 )
+
+
+class MrMc240nPointDataEx(ctypes.Structure):
+    """Binary-compatible PNT_DATA_EX from Mitsubishi mc2xxstd.h."""
+
+    _fields_ = [
+        ("position", ctypes.c_long),
+        ("speed", ctypes.c_ulong),
+        ("actime", ctypes.c_ushort),
+        ("dctime", ctypes.c_ushort),
+        ("dwell", ctypes.c_ushort),
+        ("subcmd", ctypes.c_ushort),
+        ("oas_num", ctypes.c_ubyte * 2),
+        ("reserve1", ctypes.c_ubyte * 2),
+        ("s_curve", ctypes.c_ubyte),
+        ("reserve2", ctypes.c_ubyte * 3),
+        ("sub_axnum", ctypes.c_ubyte * 3),
+        ("reserve3", ctypes.c_ubyte * 5),
+    ]
+
+
+class MrMc240nOtherAxisStartData(ctypes.Structure):
+    """Binary-compatible OAS_DATA from Mitsubishi mc2xxstd.h."""
+
+    _fields_ = [
+        ("opt_own", ctypes.c_ulong),
+        ("opt_observ", ctypes.c_ulong),
+        ("data_own", ctypes.c_long),
+        ("data_observ", ctypes.c_long),
+        ("reserve1", ctypes.c_ubyte * 8),
+        ("st_axbit", ctypes.c_ulonglong),
+        ("st_pnt_s", ctypes.c_ushort),
+        ("st_pnt_e", ctypes.c_ushort),
+        ("reserve2", ctypes.c_ubyte * 12),
+        ("reserve3", ctypes.c_ubyte * 40),
+        ("dout_ctrl", ctypes.c_ubyte),
+        ("dout_num", ctypes.c_ubyte),
+        ("dout_ctrlbit", ctypes.c_ushort),
+        ("dout_data", ctypes.c_ushort),
+        ("reserve4", ctypes.c_ubyte * 10),
+    ]
 
 
 def calculate_soft_limit_stop_margin_mm(
@@ -717,6 +767,20 @@ class MrMc240nPositionController:
     SSC_BIT_ON = 1
     SSC_DIR_PLUS = 0
     SSC_DIR_MINUS = 1
+    SSC_DRIVING = 0
+    SSC_DRIVE_FIN = 1
+    SSC_DRV_MODE_LINEAR = 6
+    SSC_SUBCMD_POS_ABS = 0x0000
+    SSC_SUBCMD_STOP_SMZ = 0x0010
+    SSC_OAS_OWN_REMAINING_DISTANCE = 0x00000000
+    SSC_OAS_OBSERV_DISABLE = 0x00000000
+    SSC_BIT_OSOP = 0x0001
+    SSC_BIT_OSFIN = 0x0002
+    SSC_BIT_OSERR = 0x0004
+    SIX_AXIS_LINEAR_GROUPS = ((1, (1, 2, 3)), (2, (4, 5, 6)))
+    SIX_AXIS_OAS_NUMBER = 1
+    SIX_AXIS_POINT_NUMBER = 0
+    SIX_AXIS_INTERPOLATION_SPEED_LIMIT = 3000
     SSC_STS_CODE_READY_FIN = 0x0001
     SSC_STS_CODE_RUNNING = 0x000A
     SSC_STS_CODE_AXIS_UNMOUNTED = 0xE400
@@ -741,6 +805,7 @@ class MrMc240nPositionController:
     SSC_STSBIT_AX_DSTO = 791
     SSC_STSBIT_AX_ISTP = 801
     SSC_STSBIT_AX_STO = 804
+    SSC_STSBIT_AX_ZREQ = 807
 
     def __init__(self, board_id, axis_number, dll_path="", auto_start_system=False):
         self.board_id = int(board_id)
@@ -963,6 +1028,15 @@ class MrMc240nPositionController:
             [ctypes.c_int, ctypes.c_int, ctypes.c_int],
         )
         self._bind_api(
+            "sscJogStopNoWait",
+            [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_short),
+            ],
+        )
+        self._bind_api(
             "sscIncStart",
             [
                 ctypes.c_int,
@@ -975,12 +1049,64 @@ class MrMc240nPositionController:
             ],
         )
         self._bind_api(
+            "sscSetPointDataEx",
+            [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(MrMc240nPointDataEx),
+            ],
+        )
+        self._bind_api(
+            "sscSetOtherAxisStartData",
+            [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(MrMc240nOtherAxisStartData),
+            ],
+        )
+        self._bind_api(
+            "sscGetOtherAxisStartStatus",
+            [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_short),
+            ],
+        )
+        self._bind_api(
+            "sscSetDriveMode",
+            [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int],
+        )
+        self._bind_api(
+            "sscLinearStart",
+            [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ],
+        )
+        self._bind_api(
             "sscHomeReturnStart",
             [ctypes.c_int, ctypes.c_int, ctypes.c_int],
         )
         self._bind_api(
             "sscDriveStop",
             [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int],
+        )
+        self._bind_api(
+            "sscDriveStopNoWait",
+            [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_short),
+            ],
         )
         self._bind_api(
             "sscDriveRapidStop",
@@ -1016,10 +1142,20 @@ class MrMc240nPositionController:
             "Mitsubishi drivers from the same Utility2 installation."
         )
 
-    def _ensure_axis_alarm_free(self):
+    @staticmethod
+    def _normalize_axis_numbers(axis_numbers):
+        axes = tuple(dict.fromkeys(int(axis) for axis in axis_numbers))
+        if not axes:
+            raise ValueError("At least one axis must be selected.")
+        if any(axis < 1 or axis > 20 for axis in axes):
+            raise ValueError("Axis numbers must be between 1 and 20.")
+        return axes
+
+    def _ensure_axis_alarm_free(self, axis_number=None):
         """Reject motion before dispatch when the board exposes an axis alarm."""
-        servo_alarm = self.get_axis_status_bit(self.SSC_STSBIT_AX_SALM)
-        operation_alarm = self.get_axis_status_bit(self.SSC_STSBIT_AX_OALM)
+        axis = self.axis_number if axis_number is None else int(axis_number)
+        servo_alarm = self.get_axis_status_bit(self.SSC_STSBIT_AX_SALM, axis)
+        operation_alarm = self.get_axis_status_bit(self.SSC_STSBIT_AX_OALM, axis)
         if servo_alarm or operation_alarm:
             alarms = []
             if servo_alarm:
@@ -1027,7 +1163,7 @@ class MrMc240nPositionController:
             if operation_alarm:
                 alarms.append("operation alarm")
             raise RuntimeError(
-                f"Axis {self.axis_number} has an active {' and '.join(alarms)}. "
+                f"Axis {axis} has an active {' and '.join(alarms)}. "
                 "Motion was not sent. Check the MR-J4 amplifier alarm code, "
                 "emergency-stop and limit inputs, clear the cause, reset the "
                 "amplifier alarm, and confirm Servo Ready before retrying."
@@ -1048,6 +1184,44 @@ class MrMc240nPositionController:
             "sscServoAlarmReset", self.board_id, self.channel, self.axis_number
         )
         return self.read_axis_status()
+
+    def reset_axis_alarms_axes(self, axis_numbers=range(1, 7)):
+        """Reset alarms on every stationary requested axis and return statuses."""
+        axes = self._normalize_axis_numbers(axis_numbers)
+        if self._motion_command_may_be_active:
+            raise RuntimeError(
+                "Six-axis alarm reset was not sent because motion may still be active."
+            )
+        statuses = {
+            axis: self.read_axis_status(axis, track_motion=False) for axis in axes
+        }
+        operating = [axis for axis, status in statuses.items() if status["operating"]]
+        if operating:
+            raise RuntimeError(
+                "Six-axis alarm reset was not sent because these axes are "
+                f"operating: {', '.join(map(str, operating))}."
+            )
+        failures = []
+        for axis in axes:
+            try:
+                self._call_api(
+                    "sscOperationAlarmReset", self.board_id, self.channel, axis
+                )
+                self._call_api(
+                    "sscServoAlarmReset", self.board_id, self.channel, axis
+                )
+            except Exception as exc:
+                failures.append((axis, exc))
+        if failures:
+            raise RuntimeError(
+                "Six-axis alarm reset failed: "
+                + "; ".join(
+                    f"axis {axis}: {error}" for axis, error in failures
+                )
+            )
+        return {
+            axis: self.read_axis_status(axis, track_motion=False) for axis in axes
+        }
 
     def _get_api(self, name):
         if self.library is None:
@@ -1386,6 +1560,80 @@ class MrMc240nPositionController:
         if not enabled:
             self._jog_active = False
 
+    def set_servo_on_axes(self, enabled, axis_numbers=range(1, 7)):
+        """Send SON/SOFF to a validated group, rolling back partial SON."""
+        axes = self._normalize_axis_numbers(axis_numbers)
+        if enabled:
+            system_status = self.get_system_status_code()
+            if system_status != self.SSC_STS_CODE_RUNNING:
+                raise RuntimeError(
+                    "Six-axis Servo ON was not sent because the MR-MC240N "
+                    f"system is not running (status=0x{system_status:04X})."
+                )
+            for axis in axes:
+                self.read_feedback_position_counts(axis)
+            self.set_software_forced_stop(False)
+            stop_status = self.read_system_status()
+            if stop_status["forced_stop_active"]:
+                raise RuntimeError(
+                    "Six-axis Servo ON was not sent because EMIO remains ON "
+                    "after releasing the SEMI software forced stop."
+                )
+
+        bit_value = self.SSC_BIT_ON if enabled else self.SSC_BIT_OFF
+        completed_axes = []
+        failures = []
+        for axis in axes:
+            try:
+                self._call_api(
+                    "sscSetCommandBitSignalEx",
+                    self.board_id,
+                    self.channel,
+                    axis,
+                    self.SSC_CMDBIT_AX_SON,
+                    bit_value,
+                )
+                completed_axes.append(axis)
+            except Exception as exc:
+                failures.append((axis, exc))
+                if enabled:
+                    break
+
+        if failures and enabled:
+            rollback_failures = []
+            for axis in completed_axes:
+                try:
+                    self._call_api(
+                        "sscSetCommandBitSignalEx",
+                        self.board_id,
+                        self.channel,
+                        axis,
+                        self.SSC_CMDBIT_AX_SON,
+                        self.SSC_BIT_OFF,
+                        allow_cleanup_pending=True,
+                    )
+                except Exception as exc:
+                    rollback_failures.append((axis, exc))
+            details = "; ".join(
+                f"axis {axis}: {error}" for axis, error in failures
+            )
+            if rollback_failures:
+                details += "; rollback failed: " + "; ".join(
+                    f"axis {axis}: {error}" for axis, error in rollback_failures
+                )
+            raise RuntimeError(f"Six-axis Servo ON failed: {details}")
+
+        if failures:
+            details = "; ".join(
+                f"axis {axis}: {error}" for axis, error in failures
+            )
+            raise RuntimeError(f"Six-axis Servo OFF failed: {details}")
+
+        self._servo_commanded_on = bool(enabled)
+        if not enabled:
+            self._jog_active = False
+        return axes
+
     def set_software_forced_stop(self, enabled):
         """Set the system SEMI command bit (axis No. 0)."""
         bit_value = self.SSC_BIT_ON if enabled else self.SSC_BIT_OFF
@@ -1446,7 +1694,7 @@ class MrMc240nPositionController:
             ),
         }
 
-    def read_axis_status(self, axis_number=None):
+    def read_axis_status(self, axis_number=None, track_motion=True):
         axis = self.axis_number if axis_number is None else int(axis_number)
         status_bits = {
             "servo_ready": self.SSC_STSBIT_AX_RDY,
@@ -1465,15 +1713,66 @@ class MrMc240nPositionController:
             "home_reset_mode": self.SSC_STSBIT_AX_DSTO,
             "interlock_stop": self.SSC_STSBIT_AX_ISTP,
             "startup_accepted": self.SSC_STSBIT_AX_STO,
+            "home_required": self.SSC_STSBIT_AX_ZREQ,
         }
         status = {
             name: self.get_axis_status_bit(bit_number, axis)
             for name, bit_number in status_bits.items()
         }
+        # ZP reports completion of the last home operation and turns OFF at
+        # the next start/mode change. ZREQ reports whether the reference must
+        # be established again (MR-MC200 Details, sections 5.8 and 6.22).
+        status["home_established"] = (
+            not status["home_required"] and not status["absolute_encoder_error"]
+        )
         status["axis"] = axis
         status["position"] = self.read_feedback_position_counts(axis)
-        self._update_motion_latch_from_status(status)
+        if track_motion and not self._motion_kind.startswith("batch_"):
+            self._update_motion_latch_from_status(status)
         return status
+
+    def _preflight_motion_axes(self, axis_numbers):
+        """Validate every requested axis before any multi-axis command is sent."""
+        axes = self._normalize_axis_numbers(axis_numbers)
+        statuses = {}
+        failures = []
+        for axis in axes:
+            try:
+                status = self.read_axis_status(axis, track_motion=False)
+                statuses[axis] = status
+                reasons = []
+                if status.get("servo_alarm"):
+                    reasons.append("servo alarm")
+                if status.get("operation_alarm"):
+                    reasons.append("operation alarm")
+                if status.get("operating"):
+                    reasons.append("already operating")
+                if not status.get("servo_ready"):
+                    reasons.append("servo ready (RDY) is off")
+                if reasons:
+                    failures.append(f"axis {axis}: {', '.join(reasons)}")
+            except Exception as exc:
+                failures.append(f"axis {axis}: status read failed ({exc})")
+        if failures:
+            raise RuntimeError(
+                "Six-axis command was not sent because preflight failed: "
+                + "; ".join(failures)
+            )
+        return axes, statuses
+
+    def _abort_partial_batch_dispatch(self, axes, action, dispatch_error):
+        """Force-stop all batch axes after an ambiguous or partial dispatch."""
+        stop_error = None
+        try:
+            self.stop_all_axes(axis_numbers=axes, rapid=True, timeout_ms=3000)
+        except Exception as exc:
+            stop_error = exc
+        detail = f"{action} failed after a batch dispatch began: {dispatch_error}"
+        if stop_error is None:
+            detail += "; all requested axes were force-stopped"
+        else:
+            detail += f"; all-axis force stop also failed: {stop_error}"
+        raise RuntimeError(detail) from dispatch_error
 
     @staticmethod
     def axis_not_ready_reasons(status, system_status=None):
@@ -1558,6 +1857,366 @@ class MrMc240nPositionController:
         ):
             self._jog_active = False
             self._clear_motion_latch()
+
+    def start_jog_axes(
+        self,
+        direction,
+        speed,
+        acceleration_ms,
+        deceleration_ms,
+        axis_numbers=range(1, 7),
+    ):
+        speed, acceleration_ms, deceleration_ms = self._validate_motion_values(
+            speed, acceleration_ms, deceleration_ms
+        )
+        if direction not in (self.SSC_DIR_PLUS, self.SSC_DIR_MINUS):
+            raise ValueError("Jog direction must be SSC_DIR_PLUS or SSC_DIR_MINUS.")
+        axes, statuses = self._preflight_motion_axes(axis_numbers)
+        self._begin_motion_dispatch(statuses[axes[0]]["position"], "batch_jog")
+        try:
+            for axis in axes:
+                self._call_api(
+                    "sscJogStart",
+                    self.board_id,
+                    self.channel,
+                    axis,
+                    speed,
+                    acceleration_ms,
+                    deceleration_ms,
+                    bytes([direction]),
+                )
+        except Exception as exc:
+            self._abort_partial_batch_dispatch(axes, "Six-axis JOG", exc)
+        self._confirm_motion_dispatch()
+        self._jog_active = True
+        return axes
+
+    def stop_jog_axes(self, axis_numbers=range(1, 7), timeout_ms=3000):
+        timeout_ms = int(timeout_ms)
+        if not 0 <= timeout_ms <= 65_535:
+            raise ValueError("Stop timeout must be between 0 and 65535 ms.")
+        axes = self._normalize_axis_numbers(axis_numbers)
+        try:
+            self._stop_axes_no_wait(
+                "sscJogStopNoWait",
+                axes,
+                timeout_ms,
+                complete_status=self.SSC_BIT_OFF,
+            )
+        except Exception as stop_error:
+            try:
+                self.engage_software_forced_stop()
+            except Exception as forced_stop_error:
+                raise RuntimeError(
+                    f"Six-axis JOG stop failed ({stop_error}); SEMI forced stop "
+                    f"also failed ({forced_stop_error})"
+                ) from stop_error
+            return {
+                "mode": "software forced stop",
+                "escalated": True,
+                "primary_error": str(stop_error),
+            }
+        self._jog_active = False
+        self._clear_motion_latch()
+        return {"mode": "coordinated JOG stop", "escalated": False}
+
+    def _stop_axes_no_wait(
+        self,
+        api_name,
+        axis_numbers,
+        timeout_ms,
+        complete_status,
+    ):
+        """Dispatch every stop before polling any axis for completion."""
+        axes = self._normalize_axis_numbers(axis_numbers)
+        effective_timeout_ms = 20_000 if int(timeout_ms) == 0 else int(timeout_ms)
+        deadline = time.monotonic() + effective_timeout_ms / 1000.0
+        pending = set()
+        failures = []
+
+        def request_stop(axis):
+            stop_status = ctypes.c_short()
+            self._call_api(
+                api_name,
+                self.board_id,
+                self.channel,
+                axis,
+                ctypes.byref(stop_status),
+                allow_cleanup_pending=True,
+            )
+            return int(stop_status.value)
+
+        # This first pass is deliberately separate from completion polling so
+        # no group waits for another group to finish before receiving STP.
+        for axis in axes:
+            try:
+                if request_stop(axis) != int(complete_status):
+                    pending.add(axis)
+            except Exception as exc:
+                failures.append((axis, exc))
+
+        if failures:
+            details = "; ".join(
+                f"axis {axis}: {error}" for axis, error in failures
+            )
+            raise RuntimeError(f"{api_name} initial dispatch failed: {details}")
+
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"{api_name} did not complete within {effective_timeout_ms} ms "
+                    f"for axis/axes {', '.join(map(str, sorted(pending)))}."
+                )
+            time.sleep(min(0.01, remaining))
+            poll_failures = []
+            for axis in tuple(sorted(pending)):
+                try:
+                    if request_stop(axis) == int(complete_status):
+                        pending.remove(axis)
+                except Exception as exc:
+                    poll_failures.append((axis, exc))
+            if poll_failures:
+                details = "; ".join(
+                    f"axis {axis}: {error}" for axis, error in poll_failures
+                )
+                raise RuntimeError(f"{api_name} completion check failed: {details}")
+
+        return axes
+
+    def move_relative_axes(
+        self,
+        distance_counts_by_axis,
+        speed,
+        acceleration_ms,
+        deceleration_ms,
+        axis_numbers=range(1, 7),
+    ):
+        axes, statuses = self._preflight_motion_axes(axis_numbers)
+        speed, acceleration_ms, deceleration_ms = self._validate_motion_values(
+            speed, acceleration_ms, deceleration_ms
+        )
+        if isinstance(distance_counts_by_axis, dict):
+            distances = {
+                axis: int(distance_counts_by_axis[axis]) for axis in axes
+            }
+        else:
+            distances = {axis: int(distance_counts_by_axis) for axis in axes}
+        for axis, distance_counts in distances.items():
+            if not -2_147_483_647 <= distance_counts <= 2_147_483_647:
+                raise ValueError(
+                    f"Axis {axis} relative distance exceeds the signed "
+                    "32-bit command range."
+                )
+            if distance_counts == 0:
+                raise ValueError(f"Axis {axis} relative distance must not be zero.")
+
+        self._begin_motion_dispatch(statuses[axes[0]]["position"], "batch_relative")
+        try:
+            for axis in axes:
+                self._call_api(
+                    "sscIncStart",
+                    self.board_id,
+                    self.channel,
+                    axis,
+                    distances[axis],
+                    speed,
+                    acceleration_ms,
+                    deceleration_ms,
+                )
+        except Exception as exc:
+            self._abort_partial_batch_dispatch(axes, "Six-axis relative move", exc)
+        self._confirm_motion_dispatch()
+        return axes
+
+    def start_six_axis_linear_interpolation(
+        self,
+        target_counts_by_axis,
+        speed,
+        acceleration_ms,
+        deceleration_ms,
+    ):
+        """Start two 3-axis interpolation groups through one board-side OAS.
+
+        MR-MC200 hardware limits one linear interpolation group to four axes.
+        Axes 1-3 are group 1 and axes 4-6 are group 2.  Point 0 of group 1
+        arms OAS data 1, which starts primary axis 4 (and therefore group 2)
+        as soon as group 1 starts.  Only one host start call is issued.
+        """
+        axes = tuple(range(1, 7))
+        _, statuses = self._preflight_motion_axes(axes)
+        not_homed = [
+            axis for axis, status in statuses.items() if not status["home_established"]
+        ]
+        if not_homed:
+            raise RuntimeError(
+                "Six-axis interpolation requires a valid home reference on "
+                f"every axis. Not homed: {', '.join(map(str, not_homed))}."
+            )
+
+        speed, acceleration_ms, deceleration_ms = self._validate_motion_values(
+            speed, acceleration_ms, deceleration_ms
+        )
+        targets = {
+            axis: int(target_counts_by_axis[axis]) for axis in axes
+        }
+        for axis, target in targets.items():
+            if not -2_147_483_648 <= target <= 2_147_483_647:
+                raise ValueError(
+                    f"Axis {axis} interpolation target exceeds the signed "
+                    "32-bit point-table range."
+                )
+        deltas = {
+            axis: targets[axis] - int(statuses[axis]["position"])
+            for axis in axes
+        }
+        excessive_moves = [
+            axis for axis, delta in deltas.items() if abs(delta) > 999_999_999
+        ]
+        if excessive_moves:
+            raise ValueError(
+                "Linear interpolation movement exceeds the MR-MC200 "
+                "999999999-command-unit limit on axes: "
+                + ", ".join(map(str, excessive_moves))
+                + "."
+            )
+        maximum_axis_distance = max(abs(delta) for delta in deltas.values())
+        if maximum_axis_distance == 0:
+            raise ValueError("Six-axis interpolation target equals every current position.")
+
+        group_speeds = {}
+        for group_number, group_axes in self.SIX_AXIS_LINEAR_GROUPS:
+            vector_distance = math.sqrt(
+                sum(float(deltas[axis]) ** 2 for axis in group_axes)
+            )
+            vector_speed = max(
+                1,
+                int(math.ceil(speed * vector_distance / maximum_axis_distance)),
+            )
+            if vector_speed > 2_147_483_647:
+                raise ValueError(
+                    f"Interpolation vector speed for group {group_number} "
+                    "exceeds the API range."
+                )
+            if vector_speed > self.SIX_AXIS_INTERPOLATION_SPEED_LIMIT:
+                raise ValueError(
+                    f"Interpolation vector speed {vector_speed} for group "
+                    f"{group_number} exceeds parameter 0262/0263 limit "
+                    f"{self.SIX_AXIS_INTERPOLATION_SPEED_LIMIT}. Reduce the "
+                    "requested per-axis speed."
+                )
+            group_speeds[group_number] = vector_speed
+
+        point_number = self.SIX_AXIS_POINT_NUMBER
+        group_by_axis = {
+            axis: group_number
+            for group_number, group_axes in self.SIX_AXIS_LINEAR_GROUPS
+            for axis in group_axes
+        }
+        point_data_by_axis = {}
+        for axis in axes:
+            point = MrMc240nPointDataEx()
+            point.position = targets[axis]
+            point.speed = group_speeds[group_by_axis[axis]]
+            point.actime = acceleration_ms
+            point.dctime = deceleration_ms
+            point.dwell = 0
+            point.subcmd = self.SSC_SUBCMD_POS_ABS | self.SSC_SUBCMD_STOP_SMZ
+            if axis == 1:
+                point.oas_num[0] = self.SIX_AXIS_OAS_NUMBER
+            point_data_by_axis[axis] = point
+            self._call_api(
+                "sscSetPointDataEx",
+                self.board_id,
+                self.channel,
+                axis,
+                point_number,
+                ctypes.byref(point),
+            )
+
+        oas_data = MrMc240nOtherAxisStartData()
+        oas_data.opt_own = self.SSC_OAS_OWN_REMAINING_DISTANCE
+        oas_data.opt_observ = self.SSC_OAS_OBSERV_DISABLE
+        # A maximum remaining-distance threshold is already satisfied when
+        # group 1 starts, so the board starts group 2 without a second host
+        # motion call.
+        oas_data.data_own = 2_147_483_647
+        oas_data.data_observ = 0
+        oas_data.st_axbit = 1 << (4 - 1)  # Primary axis of group 2.
+        oas_data.st_pnt_s = point_number
+        oas_data.st_pnt_e = point_number
+        self._call_api(
+            "sscSetOtherAxisStartData",
+            self.board_id,
+            self.channel,
+            self.SIX_AXIS_OAS_NUMBER,
+            ctypes.byref(oas_data),
+        )
+
+        for axis in axes:
+            self._call_api(
+                "sscSetDriveMode",
+                self.board_id,
+                self.channel,
+                axis,
+                self.SSC_DRV_MODE_LINEAR,
+            )
+
+        self._begin_motion_dispatch(statuses[1]["position"], "batch_linear")
+        try:
+            self._call_api(
+                "sscLinearStart",
+                self.board_id,
+                self.channel,
+                1,
+                1,
+                point_number,
+                point_number,
+            )
+        except Exception as exc:
+            self._abort_partial_batch_dispatch(
+                axes, "Six-axis linked interpolation", exc
+            )
+        self._confirm_motion_dispatch()
+        return {
+            "axes": axes,
+            "targets": targets,
+            "group_speeds": group_speeds,
+            "oas_number": self.SIX_AXIS_OAS_NUMBER,
+        }
+
+    def read_six_axis_link_status(self):
+        oas_status = ctypes.c_short()
+        self._call_api(
+            "sscGetOtherAxisStartStatus",
+            self.board_id,
+            self.channel,
+            self.SIX_AXIS_OAS_NUMBER,
+            ctypes.byref(oas_status),
+        )
+        value = int(oas_status.value) & 0xFFFF
+        return {
+            "raw": value,
+            "monitoring": bool(value & self.SSC_BIT_OSOP),
+            "completed": bool(value & self.SSC_BIT_OSFIN),
+            "failed": bool(value & self.SSC_BIT_OSERR),
+        }
+
+    def start_home_return_axes(self, axis_numbers=range(1, 7)):
+        axes, statuses = self._preflight_motion_axes(axis_numbers)
+        self._begin_motion_dispatch(statuses[axes[0]]["position"], "batch_home")
+        try:
+            for axis in axes:
+                self._call_api(
+                    "sscHomeReturnStart",
+                    self.board_id,
+                    self.channel,
+                    axis,
+                )
+        except Exception as exc:
+            self._abort_partial_batch_dispatch(axes, "Six-axis home return", exc)
+        self._confirm_motion_dispatch()
+        return axes
 
     def start_jog(self, direction, speed, acceleration_ms, deceleration_ms):
         speed, acceleration_ms, deceleration_ms = self._validate_motion_values(
@@ -1690,10 +2349,11 @@ class MrMc240nPositionController:
         rapid=True,
         timeout_ms=3000,
     ):
-        """Stop every requested axis, aggregating per-axis dispatch failures."""
+        """Stop requested axes without serially waiting between group commands."""
         timeout_ms = int(timeout_ms)
         if not 0 <= timeout_ms <= 65_535:
             raise ValueError("Stop timeout must be between 0 and 65535 ms.")
+        axes = self._normalize_axis_numbers(axis_numbers)
 
         software_stop_error = None
         if rapid:
@@ -1706,10 +2366,66 @@ class MrMc240nPositionController:
             except Exception as exc:
                 software_stop_error = exc
 
-        api_name = "sscDriveRapidStop" if rapid else "sscDriveStop"
+        if not rapid:
+            linked_linear = self._motion_kind == "batch_linear"
+            dispatch_axes = []
+            covered_axes = set()
+            if linked_linear:
+                for _group_number, group_axes in self.SIX_AXIS_LINEAR_GROUPS:
+                    selected = tuple(axis for axis in axes if axis in group_axes)
+                    if selected:
+                        # STP on any interpolating axis stops the entire group.
+                        dispatch_axes.append(selected[0])
+                        covered_axes.update(selected)
+            dispatch_axes.extend(axis for axis in axes if axis not in covered_axes)
+
+            try:
+                self._stop_axes_no_wait(
+                    "sscDriveStopNoWait",
+                    dispatch_axes,
+                    timeout_ms,
+                    complete_status=self.SSC_DRIVE_FIN,
+                )
+                still_operating = [
+                    axis
+                    for axis in axes
+                    if self.get_axis_status_bit(self.SSC_STSBIT_AX_OP, axis)
+                ]
+                if still_operating:
+                    raise RuntimeError(
+                        "Stop completion was returned, but OP remained ON for "
+                        f"axis/axes {', '.join(map(str, still_operating))}."
+                    )
+            except Exception as stop_error:
+                try:
+                    self.engage_software_forced_stop()
+                except Exception as forced_stop_error:
+                    raise RuntimeError(
+                        f"Coordinated deceleration stop failed ({stop_error}); "
+                        f"SEMI forced stop also failed ({forced_stop_error})"
+                    ) from stop_error
+                return {
+                    "mode": "software forced stop",
+                    "escalated": True,
+                    "primary_error": str(stop_error),
+                }
+
+            self._jog_active = False
+            self._clear_motion_latch()
+            return {
+                "mode": (
+                    "linked linear deceleration stop"
+                    if linked_linear
+                    else "coordinated all-axis stop"
+                ),
+                "escalated": False,
+                "primary_error": "",
+            }
+
+        api_name = "sscDriveRapidStop"
         failures = []
         try:
-            for requested_axis in axis_numbers:
+            for requested_axis in axes:
                 try:
                     axis = int(requested_axis)
                     self._call_api(
