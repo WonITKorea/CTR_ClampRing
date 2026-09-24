@@ -15,11 +15,11 @@ from PyQt5.QtWidgets import QApplication, QGroupBox, QLabel, QSizePolicy
 
 from hardware import MR_CONNECTION_PCIE_API, MR_CONNECTION_USB_MAINTENANCE
 from main import (
-    AXIS_TRAVEL_MAX_MM,
     CAMERA_RECORDING_DIRECTORY,
     CTR_LOGO_HEADER_HEIGHT,
     CTR_LOGO_MAX_WIDTH,
     MOTION_RAMP_MAX_MS,
+    POSITION_INPUT_MAX_MM,
     USB_MOTION_SPEED_MAX_MM_MIN,
     ClampTestMachineApp,
 )
@@ -42,7 +42,7 @@ class DocumentFeedbackTests(unittest.TestCase):
     def test_numeric_inputs_expose_approved_ranges(self):
         self.assertEqual(
             self.window.in_min_len.validator().top(),
-            AXIS_TRAVEL_MAX_MM,
+            POSITION_INPUT_MAX_MM,
         )
         self.assertEqual(
             self.window.in_speed.validator().top(),
@@ -56,7 +56,7 @@ class DocumentFeedbackTests(unittest.TestCase):
             "197",
             0,
         )
-        self.assertNotEqual(state, QValidator.Acceptable)
+        self.assertEqual(state, QValidator.Acceptable)
 
     def test_one_time_controls_live_in_the_settings_dialog(self):
         self.assertTrue(

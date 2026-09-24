@@ -75,6 +75,11 @@ MR_MC240N_PROJECT_PATH = next(
 
 AXIS_TRAVEL_MIN_MM = 0.0
 AXIS_TRAVEL_MAX_MM = 196.0
+HOST_SOFTWARE_LIMITS_ENABLED = False
+POSITION_INPUT_MIN_MM = -2_147_483.0
+POSITION_INPUT_MAX_MM = 2_147_483.0
+POSITION_COMMAND_MIN = -2_147_483_648
+POSITION_COMMAND_MAX = 2_147_483_647
 ENCODER_INITIAL_POSITION_COUNTS = -1
 MR_MC240N_PROJECT_COMMAND_UNITS_PER_MM = 1000.0
 POSITION_SOFT_LIMIT_POLL_MS = 50
@@ -657,8 +662,8 @@ class ClampTestMachineApp(QMainWindow):
         self.in_min_len = QLineEdit("0.0")
         self.configure_double_input(
             self.in_min_len,
-            AXIS_TRAVEL_MIN_MM,
-            AXIS_TRAVEL_MAX_MM,
+            POSITION_INPUT_MIN_MM,
+            POSITION_INPUT_MAX_MM,
             description="시험 시작 위치",
         )
         layout_params.addWidget(self.in_min_len, 0, 1)
@@ -666,8 +671,8 @@ class ClampTestMachineApp(QMainWindow):
         self.in_max_len = QLineEdit("50.0")
         self.configure_double_input(
             self.in_max_len,
-            AXIS_TRAVEL_MIN_MM,
-            AXIS_TRAVEL_MAX_MM,
+            POSITION_INPUT_MIN_MM,
+            POSITION_INPUT_MAX_MM,
             description="시험 종료 위치",
         )
         layout_params.addWidget(self.in_max_len, 1, 1)
@@ -730,7 +735,7 @@ class ClampTestMachineApp(QMainWindow):
         layout_params.setColumnMinimumWidth(0, 115)
         layout_params.setColumnMinimumWidth(1, 125)
         self.lbl_test_ranges = QLabel(
-            "범위: 길이 0~196 mm · 속도 1~12,000 mm/min · "
+            "범위: 위치는 MR-MC240N 명령 범위 내 · 속도 1~12,000 mm/min · "
             "유지 0~3,600 s · Stroke 1~10,000"
         )
         self.lbl_test_ranges.setWordWrap(True)
@@ -1042,9 +1047,9 @@ class ClampTestMachineApp(QMainWindow):
         self.in_mr_relative_move_mm = QLineEdit("1.0")
         self.configure_double_input(
             self.in_mr_relative_move_mm,
-            -AXIS_TRAVEL_MAX_MM,
-            AXIS_TRAVEL_MAX_MM,
-            description="현재 위치 기준 이동량(목표 위치 0~196 mm 이내)",
+            POSITION_INPUT_MIN_MM,
+            POSITION_INPUT_MAX_MM,
+            description="현재 위치 기준 이동량(하드웨어 리밋 사용)",
         )
         motion_grid.addWidget(self.in_mr_relative_move_mm, 3, 0)
 
@@ -1062,7 +1067,7 @@ class ClampTestMachineApp(QMainWindow):
 
         motion_layout = QHBoxLayout()
         motion_layout.setSpacing(4)
-        self.btn_mr_home = QPushButton("홈(현재=0)")
+        self.btn_mr_home = QPushButton("홈 복귀")
         self.btn_mr_home.setToolTip(
             "현재 물리 위치를 0 mm로 지정합니다. 반드시 실제 하한 위치에서 실행하세요."
         )
@@ -1133,7 +1138,7 @@ class ClampTestMachineApp(QMainWindow):
         ):
             position_control_button.setMinimumHeight(36)
         self.lbl_motion_ranges = QLabel(
-            "허용 범위: 위치 0~196 mm · 속도 1~12,000 mm/min · "
+            "허용 범위: 위치는 MR-MC240N 명령 범위 내 · 속도 1~12,000 mm/min · "
             "가속/감속 0~20,000 ms"
         )
         self.lbl_motion_ranges.setWordWrap(True)
@@ -3390,7 +3395,7 @@ class ClampTestMachineApp(QMainWindow):
                 self.handle_position_command_error(
                     title,
                     ValueError(
-                        "CTR 프로젝트의 0~196 mm 보드 소프트 리미트는 "
+                        "CTR 프로젝트의 위치 환산값은 "
                         "Command Units / mm = 1000 설정 전용입니다."
                     ),
                 )
@@ -3399,9 +3404,10 @@ class ClampTestMachineApp(QMainWindow):
                 "This stops all axes, reboots the MR-MC240N channel, resets "
                 "its RAM parameters, writes the complete project parameter "
                 f"file ({os.path.basename(parameter_file)}), and performs "
-                "System Start. Axis 1 is configured for a 0~196 mm software "
-                "limit and data-set home. After startup, place the axis at "
-                "the physical 0 mm endpoint and press '홈(현재=0)'. No "
+                "System Start. Board and host software limits are disabled; "
+                "configured hardware limit inputs provide overtravel "
+                "protection. After startup, verify the DOG home input and "
+                "clear the travel path before pressing '홈 복귀'. No "
                 "Servo/JOG command will be sent. Continue?"
             )
         answer = QMessageBox.question(
@@ -3435,14 +3441,14 @@ class ClampTestMachineApp(QMainWindow):
                 self.set_mr_status_text(
                     "MR-MC240N: CTR project applied and System Start "
                     f"completed ({result['parameter_count']} parameters, "
-                    f"status 0x{result['system_status']:04X}); move to physical "
-                    "0 mm and press 홈(현재=0)"
+                    f"status 0x{result['system_status']:04X}); verify the "
+                    "DOG home input and press 홈 복귀"
                 )
                 self.append_system_log(
                     "CTR project parameters applied to board RAM; System "
-                    "Start completed with EMI/EM2 test configuration and "
-                    "axis 1 software limits 0~196000 command units. The board "
-                    "limit becomes active after 홈(현재=0) completes "
+                    "Start completed with EMI/EM2 test configuration. Board "
+                    "and host software limits remain disabled; verify hardware "
+                    "limit inputs before motion. Axis zero is set after 홈 복귀 "
                     f"({result['parameter_count']} parameters)",
                     "MR-MC240N",
                 )
@@ -3821,7 +3827,9 @@ class ClampTestMachineApp(QMainWindow):
             raise ValueError("Acceleration은 0~20000 ms 범위로 입력해주세요.")
         if not 0 <= deceleration_ms <= 20_000:
             raise ValueError("Deceleration은 0~20000 ms 범위로 입력해주세요.")
-        if not -AXIS_TRAVEL_MAX_MM <= distance_mm <= AXIS_TRAVEL_MAX_MM:
+        if HOST_SOFTWARE_LIMITS_ENABLED and not (
+            -AXIS_TRAVEL_MAX_MM <= distance_mm <= AXIS_TRAVEL_MAX_MM
+        ):
             raise ValueError(
                 f"Relative Move는 {-AXIS_TRAVEL_MAX_MM:g}~"
                 f"{AXIS_TRAVEL_MAX_MM:g} mm 범위여야 합니다."
@@ -4066,8 +4074,8 @@ class ClampTestMachineApp(QMainWindow):
             self.position_zero_offset_mm = 0.0
             return
         raise RuntimeError(
-            "0~196 mm 보드 소프트 리미트는 원점 설정 후 활성화됩니다. "
-            "축을 실제 0 mm 위치에 둔 다음 '홈(현재=0)'을 먼저 누르세요."
+            "자동 반복 시험의 절대 위치 기준이 설정되지 않았습니다. "
+            "DOG 홈 입력과 하드웨어 리밋을 확인한 다음 '홈 복귀'를 먼저 누르세요."
         )
 
     def get_position_controller(self, require_armed=True):
@@ -4203,7 +4211,7 @@ class ClampTestMachineApp(QMainWindow):
             )
             return
 
-        if not (
+        if HOST_SOFTWARE_LIMITS_ENABLED and not (
             AXIS_TRAVEL_MIN_MM
             <= machine_position_mm
             <= AXIS_TRAVEL_MAX_MM
@@ -4234,13 +4242,13 @@ class ClampTestMachineApp(QMainWindow):
             self.position_home_established = True
             self.position_zero_offset_mm = 0.0
             self.append_system_log(
-                "Axis 1 data-set home completed at 0 mm; board software "
-                "limits 0~196 mm are now active",
+                "Axis 1 DOG home completed at 0 mm; software limits "
+                "remain disabled and hardware limit inputs remain active",
                 "MR-MC240N",
                 dedupe_seconds=0,
             )
 
-        if self.position_jog_command_active:
+        if HOST_SOFTWARE_LIMITS_ENABLED and self.position_jog_command_active:
             motion_config = self.get_position_motion_config()
             stop_margin_mm = self.get_jog_soft_limit_stop_margin_mm(
                 motion_config
@@ -4319,11 +4327,11 @@ class ClampTestMachineApp(QMainWindow):
     def start_position_home(self):
         answer = QMessageBox.question(
             self,
-            "Set Current Position to 0 mm",
-            "축 1은 리미트 스위치가 없는 데이터셋 원점 방식입니다.\n\n"
-            "현재 축이 실제 기계 하한 0 mm 위치에 있습니까?\n"
-            "계속하면 현재 위치를 0 mm로 지정하고 보드의 0~196 mm "
-            "소프트 리미트를 활성화합니다.",
+            "Home Return to DOG Sensor",
+            "축이 마이너스 방향의 별도 DOG 홈 스위치로 이동합니다.\n\n"
+            "이동 경로가 비어 있고 DOG 입력이 스위치 ON에서 검출되는지 확인했습니까?\n"
+            "접근 속도는 500 mm/min, 센서 이탈 속도는 50 mm/min입니다. "
+            "완료 위치가 0 mm로 설정되며 소프트웨어 리밋은 비활성 상태로 유지됩니다.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -4340,8 +4348,8 @@ class ClampTestMachineApp(QMainWindow):
             self.begin_position_motion_status_monitor()
             self.update_position_control_state()
             self.set_mr_status_text(
-                f"MR-MC240N: setting axis {controller.axis_number} current "
-                "position to 0 mm"
+                f"MR-MC240N: axis {controller.axis_number} home return started "
+                "toward the minus-direction DOG home sensor"
             )
         except Exception as exc:
             if controller is not None:
@@ -4352,13 +4360,14 @@ class ClampTestMachineApp(QMainWindow):
                 self.update_position_control_state()
             if not self.position_motion_may_be_active:
                 self.position_home_command_pending = False
-            self.handle_position_command_error("Set current position to 0 mm", exc)
+            self.handle_position_command_error("Home return to DOG sensor", exc)
 
     def start_position_relative_move(self):
         controller = None
         try:
             controller = self.get_position_controller(require_armed=True)
-            self.require_position_home_established(controller)
+            if HOST_SOFTWARE_LIMITS_ENABLED:
+                self.require_position_home_established(controller)
             board_config = self.get_position_monitor_config()
             motion_config = self.get_position_motion_config()
             current_position_mm, current_position_counts = (
@@ -4373,7 +4382,7 @@ class ClampTestMachineApp(QMainWindow):
             target_machine_position_mm = (
                 machine_position_mm + motion_config["distance_mm"]
             )
-            if not (
+            if HOST_SOFTWARE_LIMITS_ENABLED and not (
                 AXIS_TRAVEL_MIN_MM
                 <= target_machine_position_mm
                 <= AXIS_TRAVEL_MAX_MM
@@ -4389,6 +4398,11 @@ class ClampTestMachineApp(QMainWindow):
             if distance_counts == 0:
                 raise ValueError(
                     "Relative Move와 Command Units / mm 조합이 1 command unit 미만입니다."
+                )
+            if not POSITION_COMMAND_MIN <= distance_counts <= POSITION_COMMAND_MAX:
+                raise ValueError(
+                    "Relative Move command exceeds the MR-MC240N signed "
+                    "32-bit command-unit range."
                 )
             controller.move_relative(
                 distance_counts,
@@ -4435,9 +4449,13 @@ class ClampTestMachineApp(QMainWindow):
         controller = None
         try:
             controller = self.get_position_controller(require_armed=True)
-            self.require_position_home_established(controller)
+            if HOST_SOFTWARE_LIMITS_ENABLED:
+                self.require_position_home_established(controller)
             motion_config = self.get_position_motion_config()
-            if hasattr(controller, "read_feedback_position_counts"):
+            if (
+                HOST_SOFTWARE_LIMITS_ENABLED
+                and hasattr(controller, "read_feedback_position_counts")
+            ):
                 board_config = self.get_position_monitor_config()
                 _, current_position_counts = self.read_position_feedback()
                 if current_position_counts is None:
@@ -4877,12 +4895,16 @@ class ClampTestMachineApp(QMainWindow):
         deceleration_ms = int(self.in_mr_deceleration_ms.text())
         position_config = self.get_position_monitor_config()
 
-        if not AXIS_TRAVEL_MIN_MM <= minimum_mm <= AXIS_TRAVEL_MAX_MM:
+        if HOST_SOFTWARE_LIMITS_ENABLED and not (
+            AXIS_TRAVEL_MIN_MM <= minimum_mm <= AXIS_TRAVEL_MAX_MM
+        ):
             raise ValueError(
                 f"Min Length는 {AXIS_TRAVEL_MIN_MM:g}~"
                 f"{AXIS_TRAVEL_MAX_MM:g} mm 범위여야 합니다."
             )
-        if not AXIS_TRAVEL_MIN_MM <= maximum_mm <= AXIS_TRAVEL_MAX_MM:
+        if HOST_SOFTWARE_LIMITS_ENABLED and not (
+            AXIS_TRAVEL_MIN_MM <= maximum_mm <= AXIS_TRAVEL_MAX_MM
+        ):
             raise ValueError(
                 f"Max Length는 {AXIS_TRAVEL_MIN_MM:g}~"
                 f"{AXIS_TRAVEL_MAX_MM:g} mm 범위여야 합니다."
@@ -4977,7 +4999,7 @@ class ClampTestMachineApp(QMainWindow):
             raw_counts,
             motion_config["counts_per_mm"],
         )
-        if not (
+        if HOST_SOFTWARE_LIMITS_ENABLED and not (
             AXIS_TRAVEL_MIN_MM
             <= machine_position_mm
             <= AXIS_TRAVEL_MAX_MM
@@ -5028,7 +5050,7 @@ class ClampTestMachineApp(QMainWindow):
             config["counts_per_mm"],
         )
         target_machine_position_mm = machine_position_mm + distance_mm
-        if not (
+        if HOST_SOFTWARE_LIMITS_ENABLED and not (
             AXIS_TRAVEL_MIN_MM
             <= target_machine_position_mm
             <= AXIS_TRAVEL_MAX_MM
@@ -5055,6 +5077,11 @@ class ClampTestMachineApp(QMainWindow):
         distance_counts = round(distance_mm * config["counts_per_mm"])
         if distance_counts == 0:
             raise RuntimeError("이동량이 1 command unit 미만입니다.")
+        if not POSITION_COMMAND_MIN <= distance_counts <= POSITION_COMMAND_MAX:
+            raise RuntimeError(
+                "Automatic move command exceeds the MR-MC240N signed "
+                "32-bit command-unit range."
+            )
         try:
             controller.move_relative(
                 distance_counts,
@@ -5629,8 +5656,7 @@ class ClampTestMachineApp(QMainWindow):
             try:
                 current_position_mm, current_position_counts = self.read_position_feedback()
                 # Axis zero is established only by the explicit data-set Home
-                # command so the display coordinate cannot drift away from the
-                # board's fixed 0~196 mm software-limit coordinate system.
+                # command so the displayed coordinate remains deterministic.
                 self.latest_live_position_mm = current_position_mm
                 self.latest_live_position_counts = current_position_counts
                 if self.position_monitor is not None:

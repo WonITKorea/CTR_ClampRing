@@ -85,7 +85,7 @@ class PositionBoardProjectTests(unittest.TestCase):
         self.assertEqual(project["connection"], "PCIe control (API)")
         self.assertEqual(project["tool_mode"], 1)
         self.assertEqual(project["tool_mode_name"], "Test Mode")
-        self.assertEqual(project["control_axes"], [1])
+        self.assertEqual(project["control_axes"], [1, 2, 3, 4, 5, 6])
         self.assertTrue(project["parameter_file"].endswith("SampleData.prm2"))
         self.assertTrue(os.path.isfile(project["parameter_file"]))
         self.assertTrue(os.path.isfile(project["point_file"]))
@@ -103,6 +103,9 @@ class PositionBoardProjectTests(unittest.TestCase):
                     "0X022A",
                     "0X022B",
                     "0X0240",
+                    "0X0242",
+                    "0X0243",
+                    "0X024C",
                     "0X1100",
                     "0X1103",
                 ):
@@ -111,25 +114,18 @@ class PositionBoardProjectTests(unittest.TestCase):
                         fields[2], 16
                     )
         self.assertEqual(
-            (
-                axis_mapping[1]["0X0200"],
-                axis_mapping[1]["0X0203"],
-            ),
-            (1, 1),
-        )
-        self.assertEqual(
             [
                 (
                     axis_mapping[axis]["0X0200"],
                     axis_mapping[axis]["0X0203"],
                 )
-                for axis in range(2, 7)
+                for axis in range(1, 7)
             ],
-            [(0, 0)] * 5,
+            [(1, axis_number) for axis_number in range(6, 0, -1)],
         )
         self.assertEqual(
             [axis_mapping[axis]["0X0219"] for axis in range(1, 7)],
-            [0x0303] * 6,
+            [0x0001] * 6,
         )
         software_upper_limit = (
             axis_mapping[1]["0X0228"]
@@ -140,9 +136,24 @@ class PositionBoardProjectTests(unittest.TestCase):
             | axis_mapping[1]["0X022B"] << 16
         )
         self.assertEqual(software_lower_limit, 0)
-        self.assertEqual(software_upper_limit, 196_000)
-        # Data-set home: the physical lower endpoint is explicitly made 0 mm.
-        self.assertEqual(axis_mapping[1]["0X0240"] & 0xF, 0x2)
+        self.assertEqual(software_upper_limit, 0)
+        # Minus-direction dog home with an NO DOG input, 500/50 mm/min.
+        self.assertEqual(
+            [axis_mapping[axis]["0X0240"] for axis in range(1, 7)],
+            [0x0100] * 6,
+        )
+        self.assertEqual(
+            [
+                axis_mapping[axis]["0X0242"]
+                | axis_mapping[axis]["0X0243"] << 16
+                for axis in range(1, 7)
+            ],
+            [500] * 6,
+        )
+        self.assertEqual(
+            [axis_mapping[axis]["0X024C"] for axis in range(1, 7)],
+            [50] * 6,
+        )
         self.assertEqual(axis_mapping[1]["0X1100"], 0x1000)
         # MR-J4 PA04.2=1: disable the amplifier EM2/EM1 forced-stop input.
         self.assertEqual(axis_mapping[1]["0X1103"], 0x2100)

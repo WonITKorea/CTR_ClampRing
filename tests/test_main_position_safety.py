@@ -165,7 +165,7 @@ class PositionUiSafetyTests(unittest.TestCase):
         self.assertFalse(self.window.position_jog_command_active)
         self.assertFalse(self.window.position_motion_may_be_active)
 
-    def test_relative_move_is_blocked_by_machine_coordinate_upper_limit(self):
+    def test_relative_move_is_not_blocked_by_disabled_software_limit(self):
         monitor = SimpleNamespace(
             axis_number=1,
             _jog_active=False,
@@ -175,7 +175,7 @@ class PositionUiSafetyTests(unittest.TestCase):
         )
         self.window.position_monitor = monitor
         self.window.position_home_established = True
-        # A display offset must never move the fixed board safety boundary.
+        # Hardware limits now provide overtravel protection.
         self.window.position_zero_offset_mm = 50.0
 
         with (
@@ -208,7 +208,7 @@ class PositionUiSafetyTests(unittest.TestCase):
         ):
             self.window.start_position_relative_move()
 
-        monitor.move_relative.assert_not_called()
+        monitor.move_relative.assert_called_once_with(1_000, 100, 10, 10)
 
     def test_stop_open_failure_does_not_invent_motion_uncertainty(self):
         self.window.position_monitor = None
