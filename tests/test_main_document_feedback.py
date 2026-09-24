@@ -267,6 +267,39 @@ class DocumentFeedbackTests(unittest.TestCase):
         self.assertEqual(measurement["value"], 200.0)
         self.assertEqual(measurement["peak_value"], 900.0)
 
+    def test_fc400_six_channels_are_kept_as_independent_axis_values(self):
+        self.window.ni_daq_task = SimpleNamespace(
+            ai_channels=[Mock() for _ in range(6)],
+            in_stream=SimpleNamespace(avail_samp_per_chan=2),
+            read=Mock(
+                return_value=[
+                    [1.0, 1.1],
+                    [2.0, 2.1],
+                    [3.0, 3.1],
+                    [4.0, 4.1],
+                    [5.0, 5.1],
+                    [6.0, 6.1],
+                ]
+            ),
+        )
+        config = {
+            "zero_voltage": 0.0,
+            "full_scale_voltage": 10.0,
+            "full_scale_load": 1000.0,
+        }
+        with patch.object(
+            self.window,
+            "get_fc400_config",
+            return_value=config,
+        ):
+            measurement = self.window.read_fc400_measurement()
+
+        np.testing.assert_allclose(
+            measurement["values"],
+            [110.0, 210.0, 310.0, 410.0, 510.0, 610.0],
+        )
+        self.assertEqual(measurement["samples_by_channel"][2], [300.0, 310.0])
+
     def test_buffered_overload_stops_before_position_read(self):
         self.window.is_test_running = True
         self.window.live_motion_cycle_active = True

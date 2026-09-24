@@ -6,6 +6,32 @@ import time
 import numpy as np
 import pandas as pd
 from datetime import datetime
+
+# Initialize NI-DAQmx before PyQt loads its native DLLs.  On the deployed
+# Windows image, creating the first DAQmx task after importing PyQt5 raises a
+# native access violation.  An empty task performs no I/O and safely primes
+# the driver so later configured acquisition tasks can be created normally.
+try:
+    import nidaqmx
+    from nidaqmx.system import System
+    from nidaqmx.constants import (
+        AcquisitionType,
+        READ_ALL_AVAILABLE,
+        TerminalConfiguration,
+    )
+    with nidaqmx.Task():
+        pass
+    NIDAQMX_AVAILABLE = True
+    NIDAQMX_IMPORT_ERROR = ""
+except Exception as exc:
+    nidaqmx = None
+    System = None
+    AcquisitionType = None
+    READ_ALL_AVAILABLE = None
+    TerminalConfiguration = None
+    NIDAQMX_AVAILABLE = False
+    NIDAQMX_IMPORT_ERROR = str(exc)
+
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QGridLayout, QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox,
                              QSizePolicy, QTableWidget, QTableWidgetItem, QHeaderView, QGroupBox,
@@ -62,24 +88,24 @@ TEST_HOLD_MAX_SECONDS = 3_600.0
 TEST_STROKES_MAX = 10_000
 LOAD_INPUT_MAX = 1_000_000.0
 
-try:
-    import nidaqmx
-    from nidaqmx.system import System
-    from nidaqmx.constants import (
-        AcquisitionType,
-        READ_ALL_AVAILABLE,
-        TerminalConfiguration,
-    )
-    NIDAQMX_AVAILABLE = True
-    NIDAQMX_IMPORT_ERROR = ""
-except Exception as exc:
-    nidaqmx = None
-    System = None
-    AcquisitionType = None
-    READ_ALL_AVAILABLE = None
-    TerminalConfiguration = None
-    NIDAQMX_AVAILABLE = False
-    NIDAQMX_IMPORT_ERROR = str(exc)
+# Installed FC400 acquisition hardware and wiring (verified 2026-09-02).
+# NI device aliases such as "Dev1" can change after a driver reinstall, so the
+# refresh path identifies this USB-6002 by serial number before choosing ai0.
+FC400_NI_PRODUCT_TYPE = "USB-6002"
+FC400_NI_SERIAL_NUMBER = 0x0298D9C5
+FC400_NI_DEFAULT_DEVICE_NAME = "Dev1"
+FC400_NI_FIRST_AI_INDEX = 0
+FC400_NI_CHANNEL_COUNT = 6
+FC400_NI_LAST_AI_INDEX = FC400_NI_FIRST_AI_INDEX + FC400_NI_CHANNEL_COUNT - 1
+FC400_NI_PHYSICAL_CHANNEL = (
+    f"{FC400_NI_DEFAULT_DEVICE_NAME}/"
+    f"ai{FC400_NI_FIRST_AI_INDEX}:{FC400_NI_LAST_AI_INDEX}"
+)
+FC400_NI_TERMINAL_MODE = "RSE"
+FC400_NI_ZERO_VOLTAGE = 0.0
+FC400_NI_FULL_SCALE_VOLTAGE = 10.0
+FC400_NI_FULL_SCALE_LOAD = 1000.0
+FC400_NI_SAMPLE_RATE_HZ = 1000
 
 try:
     import cv2
@@ -753,31 +779,32 @@ class ClampTestMachineApp(QMainWindow):
         layout_fc400.setColumnStretch(1, 1)
 
         layout_fc400.addWidget(QLabel("기기 채널:"), 0, 0)
-        self.in_fc400_daq_channel = QLineEdit("Dev1/ai0")
+        self.in_fc400_daq_channel = QLineEdit(FC400_NI_PHYSICAL_CHANNEL)
         self.in_fc400_daq_channel.editingFinished.connect(self.refresh_ni_devices)
         layout_fc400.addWidget(self.in_fc400_daq_channel, 0, 1)
 
         layout_fc400.addWidget(QLabel("모드:"), 1, 0)
         self.fc400_terminal_combo = QComboBox()
         self.fc400_terminal_combo.addItems(["Differential", "RSE"])
+        self.fc400_terminal_combo.setCurrentText(FC400_NI_TERMINAL_MODE)
         layout_fc400.addWidget(self.fc400_terminal_combo, 1, 1)
 
         layout_fc400.addWidget(QLabel("무부하 전압 [V]:"), 2, 0)
-        self.in_fc400_zero_voltage = QLineEdit("0.0")
+        self.in_fc400_zero_voltage = QLineEdit(str(FC400_NI_ZERO_VOLTAGE))
         self.configure_double_input(
             self.in_fc400_zero_voltage, -10.0, 10.0, decimals=5
         )
         layout_fc400.addWidget(self.in_fc400_zero_voltage, 2, 1)
 
         layout_fc400.addWidget(QLabel("최대 출력 전압 [V]:"), 3, 0)
-        self.in_fc400_full_scale_voltage = QLineEdit("10.0")
+        self.in_fc400_full_scale_voltage = QLineEdit(str(FC400_NI_FULL_SCALE_VOLTAGE))
         self.configure_double_input(
             self.in_fc400_full_scale_voltage, -10.0, 10.0, decimals=5
         )
         layout_fc400.addWidget(self.in_fc400_full_scale_voltage, 3, 1)
 
         layout_fc400.addWidget(QLabel("FC400 최대값:"), 4, 0)
-        self.in_fc400_full_scale_load = QLineEdit("1000.0")
+        self.in_fc400_full_scale_load = QLineEdit(str(FC400_NI_FULL_SCALE_LOAD))
         self.configure_double_input(
             self.in_fc400_full_scale_load,
             0.001,
@@ -794,7 +821,7 @@ class ClampTestMachineApp(QMainWindow):
         layout_fc400.addWidget(self.fc400_device_unit_combo, 5, 1)
 
         layout_fc400.addWidget(QLabel("샘플 속도 [S/s]:"), 6, 0)
-        self.in_fc400_sample_rate = QLineEdit("1000")
+        self.in_fc400_sample_rate = QLineEdit(str(FC400_NI_SAMPLE_RATE_HZ))
         self.configure_int_input(
             self.in_fc400_sample_rate,
             1,
@@ -808,7 +835,7 @@ class ClampTestMachineApp(QMainWindow):
         layout_fc400.addWidget(self.btn_refresh_fc400_daq, 7, 0, 1, 2)
 
         init_fc400_status = (
-            "FC400 voltage output: Differential wiring V OUT -> AI0, COM -> AI4 (AI0-)"
+            "Six FC400 voltage inputs: outputs -> AI0:AI5, common COM -> AI GND (RSE)"
         )
         if not NIDAQMX_AVAILABLE:
             init_fc400_status = f"USB-6002: nidaqmx import failed - {NIDAQMX_IMPORT_ERROR}"
@@ -3485,6 +3512,7 @@ class ClampTestMachineApp(QMainWindow):
             device_summaries = []
             all_ai_channels = []
             first_ai_channel = None
+            configured_device_channel = None
             for device in System.local().devices:
                 try:
                     ai_channels = device.ai_physical_chans.channel_names
@@ -3505,16 +3533,49 @@ class ClampTestMachineApp(QMainWindow):
                 if first_ai_channel is None:
                     first_ai_channel = ai_channels[0]
 
+                try:
+                    serial_number = int(device.serial_num)
+                except Exception:
+                    serial_number = None
+                if (
+                    product_type == FC400_NI_PRODUCT_TYPE
+                    and serial_number == FC400_NI_SERIAL_NUMBER
+                ):
+                    expected_channels = [
+                        f"{device.name}/ai{index}"
+                        for index in range(
+                            FC400_NI_FIRST_AI_INDEX,
+                            FC400_NI_LAST_AI_INDEX + 1,
+                        )
+                    ]
+                    if all(channel in ai_channels for channel in expected_channels):
+                        configured_device_channel = (
+                            f"{device.name}/ai{FC400_NI_FIRST_AI_INDEX}:"
+                            f"{FC400_NI_LAST_AI_INDEX}"
+                        )
+
             channel_widget = self.in_fc400_daq_channel
             current_channel = channel_widget.text().strip()
-            default_channels = {"", "Dev1/ai0"}
-            if first_ai_channel and current_channel in default_channels:
-                channel_widget.setText(first_ai_channel)
+            default_channels = {"", FC400_NI_PHYSICAL_CHANNEL}
+            if current_channel in default_channels:
+                preferred_channel = configured_device_channel or first_ai_channel
+                if preferred_channel:
+                    channel_widget.setText(preferred_channel)
 
             configured_channel = channel_widget.text().strip()
-            self.fc400_device_ready = configured_channel in all_ai_channels
+            self.fc400_device_ready = (
+                configured_channel == configured_device_channel
+                or configured_channel in all_ai_channels
+            )
             if self.fc400_device_ready:
-                self.fc400_readiness_detail = f"{configured_channel} detected"
+                serial_detail = (
+                    f", S/N {FC400_NI_SERIAL_NUMBER}"
+                    if configured_channel == configured_device_channel
+                    else ""
+                )
+                self.fc400_readiness_detail = (
+                    f"{configured_channel} detected{serial_detail}"
+                )
                 status_text = ", ".join(device_summaries)
                 self.set_fc400_status_text("USB-6002: " + status_text)
             elif device_summaries:
@@ -3556,6 +3617,7 @@ class ClampTestMachineApp(QMainWindow):
         self.ni_daq_task = None
 
     def read_ni_daq_samples(self):
+        """Return voltage samples as ``channels x samples`` lists."""
         opened_here = False
         if self.ni_daq_task is None:
             self.open_fc400_usb_task()
@@ -3572,21 +3634,39 @@ class ClampTestMachineApp(QMainWindow):
                     number_of_samples_per_channel=READ_ALL_AVAILABLE,
                     timeout=1.0,
                 )
-            samples = np.asarray(value, dtype=float).reshape(-1)
+            samples = np.asarray(value, dtype=float)
             if samples.size == 0:
                 raise RuntimeError("USB-6002 버퍼에 읽을 샘플이 없습니다.")
+            try:
+                configured_channel_count = len(self.ni_daq_task.ai_channels)
+            except Exception:
+                configured_channel_count = 1
+            if configured_channel_count <= 1:
+                samples = samples.reshape(1, -1)
+            elif samples.ndim == 1:
+                if samples.size != configured_channel_count:
+                    raise RuntimeError(
+                        "USB-6002 returned an unexpected channel sample shape."
+                    )
+                samples = samples.reshape(configured_channel_count, 1)
+            elif samples.shape[0] != configured_channel_count:
+                raise RuntimeError(
+                    "USB-6002 channel count does not match the configured inputs."
+                )
             return samples.tolist()
         finally:
             if opened_here and not self.is_test_running:
                 self.close_ni_daq_task()
 
     def read_ni_daq_value(self):
-        return float(self.read_ni_daq_samples()[-1])
+        return float(self.read_ni_daq_samples()[0][-1])
 
     def get_fc400_config(self):
         physical_channel = self.in_fc400_daq_channel.text().strip()
         if not physical_channel:
-            raise ValueError("USB-6002 Physical Channel을 입력해주세요. 예: Dev1/ai0")
+            raise ValueError(
+                "USB-6002 Physical Channel을 입력해주세요. 예: Dev1/ai0:5"
+            )
 
         zero_voltage = float(self.in_fc400_zero_voltage.text())
         full_scale_voltage = float(self.in_fc400_full_scale_voltage.text())
@@ -3672,27 +3752,37 @@ class ClampTestMachineApp(QMainWindow):
             opened_here = True
 
         try:
-            voltages = self.read_ni_daq_samples()
+            voltage_samples_by_channel = self.read_ni_daq_samples()
             config = self.get_fc400_config()
             voltage_span = config["full_scale_voltage"] - config["zero_voltage"]
-            load_samples = [
-                (
-                    (voltage - config["zero_voltage"])
-                    / voltage_span
-                    * config["full_scale_load"]
-                )
-                for voltage in voltages
+            load_samples_by_channel = [
+                [
+                    (
+                        (voltage - config["zero_voltage"])
+                        / voltage_span
+                        * config["full_scale_load"]
+                    )
+                    for voltage in channel_voltages
+                ]
+                for channel_voltages in voltage_samples_by_channel
             ]
-            load_value = load_samples[-1]
-            peak_load_value = max(load_samples)
-            peak_voltage = voltages[load_samples.index(peak_load_value)]
+            load_values = [samples[-1] for samples in load_samples_by_channel]
+            voltage_values = [samples[-1] for samples in voltage_samples_by_channel]
+            peak_load_value = max(
+                sample
+                for channel_samples in load_samples_by_channel
+                for sample in channel_samples
+            )
             return {
-                "value": load_value,
-                "samples": load_samples,
+                # Singular keys remain as axis-1 compatibility aliases.
+                "value": load_values[0],
+                "values": load_values,
+                "samples": load_samples_by_channel[0],
+                "samples_by_channel": load_samples_by_channel,
                 "peak_value": peak_load_value,
                 "stable": None,
-                "voltage": voltages[-1],
-                "peak_voltage": peak_voltage,
+                "voltage": voltage_values[0],
+                "voltages": voltage_values,
             }
         finally:
             if opened_here and not self.is_test_running:
@@ -5282,6 +5372,7 @@ class ClampTestMachineApp(QMainWindow):
         try:
             measurement = self.read_fc400_measurement()
             load_value = measurement["value"]
+            load_values = list(measurement.get("values") or [load_value] * 6)
             live_stable = measurement["stable"]
             live_voltage = measurement["voltage"]
         except Exception as exc:
@@ -5292,13 +5383,24 @@ class ClampTestMachineApp(QMainWindow):
             )
             return
 
-        load_samples = measurement.get("samples") or [load_value]
-        tare_value = self.sensor_zeros[0]
-        peak_sample = max(
-            load_samples,
-            key=lambda sample: abs(float(sample) - tare_value),
-        )
-        peak_calibrated_base = abs(float(peak_sample) - tare_value)
+        load_samples_by_channel = measurement.get("samples_by_channel")
+        if not load_samples_by_channel:
+            load_samples = measurement.get("samples") or [load_value]
+            load_samples_by_channel = [list(load_samples)] * 6
+        peak_samples = [
+            max(
+                channel_samples,
+                key=lambda sample, tare=self.sensor_zeros[axis]: abs(
+                    float(sample) - tare
+                ),
+            )
+            for axis, channel_samples in enumerate(load_samples_by_channel)
+        ]
+        peak_calibrated_values = [
+            abs(float(sample) - self.sensor_zeros[axis])
+            for axis, sample in enumerate(peak_samples)
+        ]
+        peak_calibrated_base = max(peak_calibrated_values)
         peak_calibrated_display = abs(
             self.convert_value_units(
                 peak_calibrated_base,
@@ -5312,8 +5414,8 @@ class ClampTestMachineApp(QMainWindow):
             else float(self.in_load_limit.text())
         )
         if peak_calibrated_display >= load_limit:
-            self.raw_data = [float(peak_sample)] * 6
-            self.latest_live_snapshot = [peak_calibrated_base] * 6
+            self.raw_data = [float(sample) for sample in peak_samples]
+            self.latest_live_snapshot = peak_calibrated_values.copy()
             self.time_elapsed += self.timer_interval / 1000.0
             trip_row = {
                 "Time [sec]": round(self.time_elapsed, 3),
@@ -5326,15 +5428,24 @@ class ClampTestMachineApp(QMainWindow):
                     peak_calibrated_display, 6
                 ),
                 f"Load Limit [{self.unit}]": round(load_limit, 6),
-                "Buffered Sample Count": len(load_samples),
+                "Buffered Sample Count": max(
+                    len(samples) for samples in load_samples_by_channel
+                ),
             }
             for axis in range(1, 7):
                 trip_row[
                     f"Axis {axis} Raw [{self.data_unit}]"
-                ] = round(float(peak_sample), 6)
+                ] = round(float(peak_samples[axis - 1]), 6)
                 trip_row[
                     f"Axis {axis} Calibrated [{self.unit}]"
-                ] = round(peak_calibrated_display, 6)
+                ] = round(
+                    self.convert_value_units(
+                        peak_calibrated_values[axis - 1],
+                        self.data_unit,
+                        self.unit,
+                    ),
+                    6,
+                )
             self.time_series_data.append(trip_row)
             self.update_table()
             self.update_chart()
@@ -5352,7 +5463,7 @@ class ClampTestMachineApp(QMainWindow):
             QMessageBox.critical(self, "MR-MC240N Read Error", f"위치 값을 읽지 못했습니다.\n{exc}")
             return
 
-        self.raw_data = [load_value] * 6
+        self.raw_data = load_values
         self.update_table()
         self.update_chart()
 
@@ -5388,7 +5499,9 @@ class ClampTestMachineApp(QMainWindow):
             peak_calibrated_display,
             5,
         )
-        log_row['Buffered Sample Count'] = len(load_samples)
+        log_row['Buffered Sample Count'] = max(
+            len(samples) for samples in load_samples_by_channel
+        )
 
         for i in range(6):
             log_row[f'Axis {i+1} Raw [{self.data_unit}]'] = round(self.raw_data[i], 3)
@@ -5491,7 +5604,11 @@ class ClampTestMachineApp(QMainWindow):
         self.current_sample_result_key = None
 
         try:
-            current_value = self.read_fc400_measurement()["value"]
+            measurement = self.read_fc400_measurement()
+            current_value = measurement["value"]
+            current_values = list(
+                measurement.get("values") or [current_value] * 6
+            )
         except Exception as exc:
             self.fc400_device_ready = False
             self.fc400_readiness_detail = "zero read failed"
@@ -5504,7 +5621,7 @@ class ClampTestMachineApp(QMainWindow):
             )
             return
 
-        self.raw_data = [current_value] * 6
+        self.raw_data = current_values
         self.sensor_zeros = self.raw_data.copy()
         message_text = "로드셀 영점(Tare) 및 이전 데이터 초기화가 완료되었습니다."
 
