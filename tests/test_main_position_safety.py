@@ -8,11 +8,15 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QMessageBox
 from PyQt5.QtCore import Qt
 from PyQt5.QtTest import QTest
 
-from hardware import MR_CONNECTION_PCIE_API, MrMc240nPositionController
+from hardware import (
+    MR_CONNECTION_PCIE_API,
+    MR_CONNECTION_USB_MAINTENANCE,
+    MrMc240nPositionController,
+)
 from main import ClampTestMachineApp
 from tests.test_hardware_position_controller import fake_vendor_library
 
@@ -52,6 +56,124 @@ class PositionUiSafetyTests(unittest.TestCase):
 
     def test_mr_settings_tab_is_first(self):
         self.assertEqual(self.window.settings_tabs.tabText(0), "MR-MC240N 연결")
+
+    def test_six_axis_control_is_default_with_single_axis_opt_out(self):
+        self.assertTrue(self.window.chk_mr_six_axis_batch.isChecked())
+        self.assertEqual(self.window.get_position_command_axes(), tuple(range(1, 7)))
+        self.window.chk_mr_six_axis_batch.setChecked(False)
+        self.assertEqual(self.window.get_position_command_axes(), (1,))
+
+    def test_connect_apply_button_is_directly_above_test_start(self):
+        button = self.window.btn_mr_connect_apply_project
+        grid = self.window.btn_start.parentWidget().layout()
+        button_position = grid.getItemPosition(grid.indexOf(button))
+        start_position = grid.getItemPosition(grid.indexOf(self.window.btn_start))
+        self.assertEqual(button_position[0] + 1, start_position[0])
+        self.assertEqual(button_position[1:], start_position[1:])
+        self.assertFalse(self.window.settings_dialog.isAncestorOf(button))
+        self.assertTrue(button.isEnabled())
+
+    def test_connect_apply_button_opens_then_applies_without_motion(self):
+        controller = Mock(spec=MrMc240nPositionController)
+        controller._motion_command_may_be_active = False
+        sequence = []
+
+        def connect():
+            sequence.append("connect")
+            self.window.position_monitor = controller
+
+        def apply_project(parameter_file):
+            sequence.append("apply")
+            return {"parameter_count": 600, "system_status": 0}
+
+        controller.apply_parameter_file_and_start.side_effect = apply_project
+        with (
+            patch("main.QMessageBox.question", return_value=QMessageBox.Yes) as confirm,
+            patch.object(self.window, "open_position_monitor", side_effect=connect),
+            patch.object(self.window, "refresh_position_axis_status", side_effect=lambda: sequence.append("refresh")),
+            patch.object(self.window, "handle_position_command_error") as error,
+        ):
+            self.window.btn_mr_connect_apply_project.click()
+        self.window.position_monitor = None
+
+        confirm.assert_called_once()
+        error.assert_not_called()
+        self.assertEqual(sequence, ["connect", "apply", "refresh"])
+        controller.apply_parameter_file_and_start.assert_called_once_with(
+            self.window.mr_project_config["parameter_file"]
+        )
+        for method in (
+            controller.set_servo_on, controller.set_servo_on_axes,
+            controller.start_home_return, controller.start_home_return_axes,
+            controller.start_jog, controller.start_jog_axes,
+            controller.start_six_axis_linear_interpolation,
+        ):
+            method.assert_not_called()
+        self.assertFalse(self.window.is_test_running)
+
+    def test_connect_apply_cancel_does_not_open_the_board(self):
+        with (
+            patch("main.QMessageBox.question", return_value=QMessageBox.No),
+            patch.object(self.window, "open_position_monitor") as connect,
+        ):
+            self.window.btn_mr_connect_apply_project.click()
+        connect.assert_not_called()
+
+    def test_connect_apply_failure_reports_error_without_starting_test(self):
+        with (
+            patch("main.QMessageBox.question", return_value=QMessageBox.Yes),
+            patch.object(self.window, "open_position_monitor", side_effect=RuntimeError("board unavailable")),
+            patch.object(self.window, "handle_position_command_error") as error,
+            patch.object(self.window, "refresh_position_axis_status") as refresh,
+        ):
+            self.window.btn_mr_connect_apply_project.click()
+        error.assert_called_once()
+        refresh.assert_not_called()
+        self.assertFalse(self.window.is_test_running)
+
+    def test_connect_apply_is_locked_during_test_motion_or_failed_cleanup(self):
+        for flag in (
+            "is_test_running", "live_motion_cycle_active",
+            "position_motion_may_be_active", "position_jog_command_active",
+            "position_controller_close_failed",
+        ):
+            with self.subTest(flag=flag):
+                setattr(self.window, flag, True)
+                self.window.update_position_control_state()
+                self.assertFalse(self.window.btn_mr_connect_apply_project.isEnabled())
+                with (
+                    patch("main.QMessageBox.warning") as warning,
+                    patch("main.QMessageBox.question") as confirm,
+                    patch.object(self.window, "open_position_monitor") as connect,
+                ):
+                    self.window.start_position_usb_system()
+                warning.assert_called_once()
+                confirm.assert_not_called()
+                connect.assert_not_called()
+                setattr(self.window, flag, False)
+        self.window.position_monitor = SimpleNamespace(_motion_command_may_be_active=True)
+        self.window.update_position_control_state()
+        self.assertFalse(self.window.btn_mr_connect_apply_project.isEnabled())
+        with (
+            patch("main.QMessageBox.warning") as warning,
+            patch.object(self.window, "open_position_monitor") as connect,
+        ):
+            self.window.start_position_usb_system()
+        self.window.position_monitor = None
+        warning.assert_called_once()
+        connect.assert_not_called()
+        self.window.update_position_control_state()
+        self.assertTrue(self.window.btn_mr_connect_apply_project.isEnabled())
+
+    def test_main_project_button_requires_pcie_and_a_parameter_file(self):
+        self.window.mr_connection_combo.setCurrentText(MR_CONNECTION_USB_MAINTENANCE)
+        self.assertFalse(self.window.btn_mr_connect_apply_project.isEnabled())
+        self.assertFalse(self.window.is_six_axis_batch_enabled())
+        self.window.mr_connection_combo.setCurrentText(MR_CONNECTION_PCIE_API)
+        self.assertTrue(self.window.btn_mr_connect_apply_project.isEnabled())
+        self.window.mr_project_config = None
+        self.window.update_position_control_state()
+        self.assertFalse(self.window.btn_mr_connect_apply_project.isEnabled())
 
     def test_motion_buttons_do_not_require_arm_checkbox(self):
         self.window.chk_mr_motion_arm.setChecked(False)
@@ -196,6 +318,7 @@ class PositionUiSafetyTests(unittest.TestCase):
                         error.assert_not_called()
 
     def test_failed_jog_start_immediately_attempts_a_stop(self):
+        self.window.chk_mr_six_axis_batch.setChecked(False)
         monitor = SimpleNamespace(
             axis_number=1,
             _jog_active=False,
@@ -241,6 +364,7 @@ class PositionUiSafetyTests(unittest.TestCase):
         self.assertFalse(self.window.position_motion_may_be_active)
 
     def test_relative_move_is_not_blocked_by_disabled_software_limit(self):
+        self.window.chk_mr_six_axis_batch.setChecked(False)
         monitor = SimpleNamespace(
             axis_number=1,
             _jog_active=False,
@@ -614,6 +738,7 @@ class PositionUiSafetyTests(unittest.TestCase):
         self.assertFalse(self.window.btn_mr_home.isEnabled())
 
     def test_single_axis_test_end_keeps_selected_axis_stop(self):
+        self.window.chk_mr_six_axis_batch.setChecked(False)
         monitor = MrMc240nPositionController(board_id=0, axis_number=5)
         library = fake_vendor_library()
         monitor.library = library

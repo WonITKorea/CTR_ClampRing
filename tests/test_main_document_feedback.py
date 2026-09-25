@@ -22,6 +22,7 @@ from main import (
     POSITION_INPUT_MAX_MM,
     USB_MOTION_SPEED_MAX_MM_MIN,
     ClampTestMachineApp,
+    plt,
 )
 
 
@@ -440,6 +441,70 @@ class DocumentFeedbackTests(unittest.TestCase):
         )
         self.assertEqual(plotted_values, [11.0, 12.0, 13.0, 14.0, 15.0, 16.0])
         self.assertIn("10.000 mm", self.window.lbl_review_position.text())
+
+    def test_report_has_full_size_signatures_without_empty_padding_or_overlap(self):
+        for count in (1, 3, 10, 12):
+            with self.subTest(strokes=count):
+                self.window.stroke_data_history = [
+                    [float(axis + stroke) for axis in range(1, 7)]
+                    for stroke in range(count)
+                ]
+                self.window.stroke_position_history = [70.0] * count
+                sample = self.window.build_current_sample_result()
+                figure = self.window.build_report_figure(sample)
+                try:
+                    figure.canvas.draw()
+                    renderer = figure.canvas.get_renderer()
+                    axes = {axis.get_label(): axis for axis in figure.axes}
+                    signature = axes["report_signature"].tables[0]
+                    metadata = axes["report_metadata"].tables[0]
+                    data = axes["report_data"].tables[0]
+                    visible_count = min(count, 10)
+                    self.assertEqual(len(data.get_celld()), (visible_count + 5) * 9)
+                    self.assertNotIn("-", [cell.get_text().get_text() for cell in data.get_celld().values()])
+                    self.assertEqual(data[(visible_count + 1, 0)].get_text().get_text(), "Min")
+                    self.assertEqual(data[(visible_count + 4, 0)].get_text().get_text(), "Ave")
+                    # Statistics still include every stroke, even when only 10 are shown.
+                    self.assertEqual(data[(visible_count + 2, 2)].get_text().get_text(), f"{count:.2f}")
+                    self.assertEqual(data[(1, 2)].get_text().get_text(), "1.00")
+                    for table in (signature, metadata, data):
+                        for cell in table.get_celld().values():
+                            text_box = cell.get_text().get_window_extent(renderer)
+                            cell_box = cell.get_window_extent(renderer)
+                            self.assertLessEqual(text_box.width, cell_box.width)
+                            self.assertLessEqual(text_box.height, cell_box.height)
+                    for column in range(3):
+                        signing_box = signature[(1, column)].get_window_extent(renderer)
+                        self.assertGreaterEqual(signing_box.width / figure.dpi * 25.4, 28.0)
+                        self.assertGreaterEqual(signing_box.height / figure.dpi * 25.4, 22.0)
+                    self.assertGreater(
+                        signature.get_window_extent(renderer).y0,
+                        metadata.get_window_extent(renderer).y1,
+                    )
+                    self.assertGreater(
+                        metadata.get_window_extent(renderer).y0,
+                        data.get_window_extent(renderer).y1,
+                    )
+                    polar = next(axis for axis in figure.axes if axis.name == "polar")
+                    graph_title_box = polar.title.get_window_extent(renderer)
+                    self.assertLess(graph_title_box.y1, data.get_window_extent(renderer).y0)
+                    labels = [polar.title] + polar.get_xticklabels()
+                    for label in labels:
+                        bounds = label.get_window_extent(renderer)
+                        self.assertGreaterEqual(bounds.x0, 0)
+                        self.assertGreaterEqual(bounds.y0, 0)
+                        self.assertLessEqual(bounds.x1, figure.bbox.width)
+                        self.assertLessEqual(bounds.y1, figure.bbox.height)
+                    notes = [text for text in figure.texts if "additional strokes" in text.get_text()]
+                    self.assertEqual(len(notes), int(count > 10))
+                    if notes:
+                        self.assertIn("2 additional strokes", notes[0].get_text())
+                        note_box = notes[0].get_window_extent(renderer)
+                        self.assertLess(note_box.y1, data.get_window_extent(renderer).y0)
+                        self.assertGreater(note_box.y0, graph_title_box.y1)
+                    self.assertNotIn("report_remark", axes)
+                finally:
+                    plt.close(figure)
 
     def test_multiple_samples_are_accumulated_and_exported_as_pages(self):
         for sample_number in ("1", "2"):

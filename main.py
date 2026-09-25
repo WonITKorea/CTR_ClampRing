@@ -45,7 +45,6 @@ import matplotlib.font_manager as fm
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_pdf import PdfPages
 from scipy.interpolate import interp1d
-from matplotlib.patches import Rectangle
 import platform
 
 from hardware import (
@@ -441,7 +440,7 @@ class ClampTestMachineApp(QMainWindow):
         self.live_motion_positions_mm = {}
         self.live_motion_deadline = 0.0
         self.live_hold_deadline = 0.0
-        self.live_stroke_peak_values = None
+        self.stroke_capture_mode = None
         self.camera_capture = None
         self.camera_capture_thread = None
         self.camera_capture_stop_event = threading.Event()
@@ -782,7 +781,10 @@ class ClampTestMachineApp(QMainWindow):
         layout_settings.addWidget(QLabel("Graph Interpolation:"))
         layout_settings.addWidget(self.interp_combo)
 
-        self.btn_zero = QPushButton("영점조절 & Data 리셋")
+        self.btn_zero = QPushButton("영점조절 (Offset)")
+        self.btn_zero.setToolTip(
+            "현재 로드셀 값을 영점 기준으로 설정합니다. 기존 시험 기록과 시료 결과는 유지됩니다."
+        )
         self.btn_zero.setStyleSheet(
             "font-size: 11px; padding: 5px 8px;"
         )
@@ -1151,7 +1153,7 @@ class ClampTestMachineApp(QMainWindow):
         self.btn_mr_alarm_reset.clicked.connect(self.reset_position_axis_alarms)
         motion_grid.addWidget(self.btn_mr_alarm_reset, 7, 0, 1, 2)
         self.chk_mr_six_axis_batch = QCheckBox("6축 연계 제어 (3+3 직선보간)")
-        self.chk_mr_six_axis_batch.setChecked(False)
+        self.chk_mr_six_axis_batch.setChecked(True)
         self.chk_mr_six_axis_batch.setToolTip(
             "이동/자동시험은 축 1~3과 4~6을 두 직선보간 그룹으로 묶고 "
             "OAS 보드 내부 트리거로 연계 기동합니다. 홈/JOG/SON은 축별 "
@@ -1306,6 +1308,15 @@ class ClampTestMachineApp(QMainWindow):
         sample_layout.addLayout(sample_actions)
         left_layout.addWidget(sample_group, 2, 0, 1, 2)
 
+        self.btn_mr_connect_apply_project = QPushButton("240N 연결 + 프로젝트 적용")
+        self.btn_mr_connect_apply_project.setMinimumHeight(42)
+        self.btn_mr_connect_apply_project.setToolTip(
+            "설정된 PCIe 보드에 연결하고 CTR 프로젝트 파라미터 적용 및 System Start를 실행합니다.\n"
+            "실행 전 확인 창이 표시되며, 서보 ON·홈 복귀·이동은 자동 실행하지 않습니다."
+        )
+        self.btn_mr_connect_apply_project.clicked.connect(self.start_position_usb_system)
+        left_layout.addWidget(self.btn_mr_connect_apply_project, 3, 0, 1, 2)
+
         self.btn_start = QPushButton("FC400 + MR-MC240N 시험 시작")
         self.btn_start.clicked.connect(self.toggle_test)
         self.btn_start.setMinimumHeight(46)
@@ -1313,7 +1324,7 @@ class ClampTestMachineApp(QMainWindow):
             "background-color: #4CAF50; color: white; font-size: 12px; "
             "font-weight: bold; padding: 10px;"
         )
-        left_layout.addWidget(self.btn_start, 3, 0, 1, 2)
+        left_layout.addWidget(self.btn_start, 4, 0, 1, 2)
         left_layout.setRowStretch(5, 1)
         for widget_type in (QLineEdit, QPushButton, QComboBox):
             for widget in left_container.findChildren(widget_type):
@@ -3003,6 +3014,10 @@ class ClampTestMachineApp(QMainWindow):
                 "DAQ [V]",
             ]
         )
+        self.table.horizontalHeaderItem(3).setToolTip(
+            "표시·기록 보정값은 abs(Raw - Zero)입니다. Raw와 DAQ 전압의 부호는 유지합니다. "
+            "스트로크 결과는 홀드 종료 직전의 6채널 측정값입니다."
+        )
 
     def on_position_monitor_toggled(self, enabled):
         self.position_axis_status_checked = False
@@ -3222,6 +3237,7 @@ class ClampTestMachineApp(QMainWindow):
         )
         motion_may_be_active = (
             self.position_motion_may_be_active
+            or self.position_jog_command_active
             or controller_motion_may_be_active
         )
         configuration_locked = (
@@ -3273,6 +3289,9 @@ class ClampTestMachineApp(QMainWindow):
                     )
                 )
             )
+        )
+        self.btn_mr_connect_apply_project.setEnabled(
+            self.btn_mr_system_start.isEnabled() and not self.is_position_usb_mode()
         )
         self.btn_mr_apply_six_axis.setEnabled(
             enabled
@@ -3453,6 +3472,24 @@ class ClampTestMachineApp(QMainWindow):
             )
 
     def start_position_usb_system(self):
+        if (
+            self.is_test_running
+            or self.live_motion_cycle_active
+            or self.position_motion_may_be_active
+            or self.position_jog_command_active
+            or self.position_controller_close_failed
+            or (
+                self.position_monitor is not None
+                and self.position_monitor._motion_command_may_be_active
+            )
+        ):
+            QMessageBox.warning(
+                self,
+                "프로젝트 적용 잠금",
+                "시험 및 축 동작이 완전히 정지하고 컨트롤러 정리 상태가 확인된 뒤 "
+                "연결 / 프로젝트 적용을 실행해주세요.",
+            )
+            return
         usb_mode = self.is_position_usb_mode()
         if not usb_mode and self.mr_project_config is None:
             self.handle_position_command_error(
@@ -5696,7 +5733,7 @@ class ClampTestMachineApp(QMainWindow):
         config = self.live_motion_config
         self.live_motion_cycle_active = True
         self.current_stroke = 0
-        self.live_stroke_peak_values = None
+        self.stroke_capture_mode = "hold_end"
 
         if (
             abs(current_position_mm - config["minimum_mm"])
@@ -5714,42 +5751,28 @@ class ClampTestMachineApp(QMainWindow):
                 current_position_mm,
             )
 
-    def update_live_stroke_peak(self, calibrated_values):
-        if self.live_stroke_peak_values is None:
-            self.live_stroke_peak_values = list(calibrated_values)
-            return
-        self.live_stroke_peak_values = [
-            max(previous, current)
-            for previous, current in zip(
-                self.live_stroke_peak_values,
-                calibrated_values,
-            )
-        ]
-
-    def record_live_motion_stroke(self):
-        if self.live_stroke_peak_values is None:
-            calibrated_values = [
-                max(0, self.raw_data[index] - self.sensor_zeros[index])
-                for index in range(6)
-            ]
-        else:
-            calibrated_values = self.live_stroke_peak_values
+    def record_live_motion_stroke(self, position_mm, calibrated_values, log_row=None):
+        """Save one six-channel hold-end sample before issuing the return move."""
         self.stroke_data_history.append(list(calibrated_values))
-        self.stroke_position_history.append(self.live_motion_config["maximum_mm"])
+        self.stroke_position_history.append(position_mm)
+        if log_row is not None:
+            log_row["Result Capture"] = "HOLD_END"
+        self.append_system_log(
+            f"Stroke {self.current_stroke + 1}: 홀드 종료값 저장 "
+            f"({position_mm:.3f} mm)",
+            "TEST",
+        )
 
-    def update_live_motion_cycle(self, position_mm, calibrated_values):
+    def update_live_motion_cycle(self, position_mm, calibrated_values, log_row=None):
         if not self.live_motion_cycle_active:
             return False
 
         config = self.live_motion_config
         now = time.monotonic()
-        if self.test_state in {"MOVING_TO_MAX", "HOLDING_MAX"}:
-            self.update_live_stroke_peak(calibrated_values)
-
         if self.test_state == "HOLDING_MAX":
             if now < self.live_hold_deadline:
                 return False
-            self.record_live_motion_stroke()
+            self.record_live_motion_stroke(position_mm, calibrated_values, log_row)
             self.start_live_motion_move(
                 config["minimum_mm"],
                 "MOVING_TO_MIN",
@@ -5824,7 +5847,6 @@ class ClampTestMachineApp(QMainWindow):
             return False
 
         if self.test_state == "POSITIONING_MIN":
-            self.live_stroke_peak_values = None
             self.start_live_motion_move(
                 config["maximum_mm"],
                 "MOVING_TO_MAX",
@@ -5858,7 +5880,6 @@ class ClampTestMachineApp(QMainWindow):
                 )
                 return True
 
-            self.live_stroke_peak_values = None
             self.start_live_motion_move(
                 config["maximum_mm"],
                 "MOVING_TO_MAX",
@@ -5963,7 +5984,7 @@ class ClampTestMachineApp(QMainWindow):
         self.live_motion_target_mm = None
         self.live_motion_deadline = 0.0
         self.live_hold_deadline = 0.0
-        self.live_stroke_peak_values = None
+        self.stroke_capture_mode = "hold_end"
         self.load_limit_tripped = False
         self.refresh_review_controls()
         self.update_table_headers()
@@ -6117,7 +6138,7 @@ class ClampTestMachineApp(QMainWindow):
         self.update_chart()
 
         self.time_elapsed += self.timer_interval / 1000.0
-        current_calibrated_base = [max(0, self.raw_data[i] - self.sensor_zeros[i]) for i in range(6)]
+        current_calibrated_base = self.get_calibrated_base_data()
         self.latest_live_snapshot = current_calibrated_base.copy()
         self.latest_live_position_mm = position_mm
         self.latest_live_position_counts = position_counts
@@ -6135,6 +6156,7 @@ class ClampTestMachineApp(QMainWindow):
                 else 1
             ),
             'State': self.test_state,
+            'Result Capture': '',
         }
         if position_mm is not None:
             log_row['Position [mm]'] = round(position_mm, 3)
@@ -6164,6 +6186,7 @@ class ClampTestMachineApp(QMainWindow):
                 test_stopped = self.update_live_motion_cycle(
                     position_mm,
                     current_calibrated_base,
+                    log_row=log_row,
                 )
             except Exception as exc:
                 self.abort_live_motion_test(f"자동 왕복 시험 실패: {exc}")
@@ -6193,6 +6216,10 @@ class ClampTestMachineApp(QMainWindow):
 
     def ensure_export_snapshot(self):
         if self.stroke_data_history:
+            return
+        # Keep this policy after stop_test clears the live motion configuration.
+        # An aborted travel/partial hold is not a completed hold measurement.
+        if self.stroke_capture_mode == "hold_end":
             return
         if len(self.time_series_data) > 0:
             self.stroke_data_history = [self.latest_live_snapshot.copy()]
@@ -6239,25 +6266,14 @@ class ClampTestMachineApp(QMainWindow):
             )
             return
 
-        # 모든 물리적 데이터, 영점 기준, 그리고 이전 테스트 기록과 시계열 데이터 완전히 리셋
-        self.stroke_data_history = []
-        self.stroke_position_history = []
-        self.time_series_data = []
-        self.time_elapsed = 0.0
-        self.latest_live_snapshot = [0.0] * 6
-        self.latest_live_position_mm = None
-        self.latest_live_position_counts = None
-
-        self.test_start_ts = None
-        self.test_start_display_time = None
-        self.current_sample_result_key = None
-
         try:
             measurement = self.read_fc400_measurement()
             current_value = measurement["value"]
             current_values = list(
                 measurement.get("values") or [current_value] * 6
             )
+            if len(current_values) != 6 or not all(np.isfinite(value) for value in current_values):
+                raise ValueError("영점 설정에는 유효한 6채널 하중값이 필요합니다.")
         except Exception as exc:
             self.fc400_device_ready = False
             self.fc400_readiness_detail = "zero read failed"
@@ -6273,33 +6289,23 @@ class ClampTestMachineApp(QMainWindow):
         self.raw_data = current_values
         self.sensor_zeros = self.raw_data.copy()
         self.update_daq_measurement_status(measurement)
-        message_text = "로드셀 영점(Tare) 및 이전 데이터 초기화가 완료되었습니다."
-
-        if self.is_position_pcie_enabled():
-            try:
-                current_position_mm, current_position_counts = self.read_position_feedback()
-                # Axis zero is established only by the explicit data-set Home
-                # command so the displayed coordinate remains deterministic.
-                self.latest_live_position_mm = current_position_mm
-                self.latest_live_position_counts = current_position_counts
-                if self.position_monitor is not None:
-                    self.refresh_position_axis_status()
-            except Exception as exc:
-                self.set_mr_status_text(f"MR-MC240N: 위치 영점은 유지됨 - {exc}")
+        message_text = "로드셀 영점(Offset) 설정이 완료되었습니다. 기존 시험 기록과 시료 결과는 유지됩니다."
 
         self.update_table()
-        self.update_chart(reset_scale=True)
+        # Tare only changes the live reading. Keep the selected history graph,
+        # completed-test snapshots, timestamps and export/sample identity intact.
+        if self.review_selected_data_index is None:
+            self.update_chart(reset_scale=True)
         self.update_hardware_readiness_status()
         self.append_system_log(message_text, "TEST")
-        self.refresh_review_controls()
         QMessageBox.information(self, "Zeroed", message_text)
 
     def update_table(self):
+        calibrated_display_values = self.get_calibrated_data()
         for i in range(6):
             raw_display = self.raw_data[i]
             zero_display = self.sensor_zeros[i]
-            calibrated_base = self.raw_data[i] - self.sensor_zeros[i]
-            calibrated_display = self.convert_value_units(calibrated_base, self.data_unit, self.unit)
+            calibrated_display = calibrated_display_values[i]
             for column, text in (
                 (1, f"{raw_display:.2f}"),
                 (2, f"{zero_display:.2f}"),
@@ -6317,13 +6323,15 @@ class ClampTestMachineApp(QMainWindow):
                 elif item.text() != text:
                     item.setText(text)
 
+    def get_calibrated_base_data(self):
+        """Use the same tare-corrected magnitudes for display and new records."""
+        return [abs(self.raw_data[i] - self.sensor_zeros[i]) for i in range(6)]
+
     def get_calibrated_data(self):
-        data = []
-        for i in range(6):
-            calibrated_base = self.raw_data[i] - self.sensor_zeros[i]
-            display_val = self.convert_value_units(calibrated_base, self.data_unit, self.unit)
-            data.append(max(0, display_val))
-        return data
+        return [
+            self.convert_value_units(value, self.data_unit, self.unit)
+            for value in self.get_calibrated_base_data()
+        ]
 
     def update_chart(self, reset_scale=False):
         data = self.get_calibrated_data()
@@ -6390,8 +6398,7 @@ class ClampTestMachineApp(QMainWindow):
                 return None
             source_unit = matching_key[len(prefix):-1]
             loads.append(
-                max(
-                    0.0,
+                abs(
                     self.convert_value_units(
                         float(row[matching_key]),
                         source_unit,
@@ -6584,7 +6591,6 @@ class ClampTestMachineApp(QMainWindow):
             self.add_current_sample_result(auto=True)
         self.live_motion_config = None
         self.live_motion_target_mm = None
-        self.live_stroke_peak_values = None
         self.update_table()
         self.update_chart()
         self.refresh_review_controls()
@@ -6639,6 +6645,7 @@ class ClampTestMachineApp(QMainWindow):
             ),
             "unit": self.unit,
             "data_unit": self.data_unit,
+            "stroke_capture_mode": self.stroke_capture_mode,
             "target_load": self.in_load.text(),
             "load_limit": self.in_load_limit.text(),
             "interpolation": self.interp_combo.currentText(),
@@ -6783,7 +6790,7 @@ class ClampTestMachineApp(QMainWindow):
 
     def export_csv(self):
         self.ensure_export_snapshot()
-        if len(self.stroke_data_history) == 0:
+        if not self.stroke_data_history and not self.time_series_data:
             self.append_system_log("CSV 저장 실패: 저장할 테스트 데이터가 없습니다", "EXPORT")
             QMessageBox.warning(self, "No Data", "저장할 테스트 데이터가 없습니다.")
             return
@@ -6793,6 +6800,17 @@ class ClampTestMachineApp(QMainWindow):
         file_name, _ = QFileDialog.getSaveFileName(self, "Save CSV", default_name, "CSV Files (*.csv)")
 
         if file_name:
+            if not self.stroke_data_history:
+                # Preserve aborted-test diagnostics without fabricating a stroke.
+                pd.DataFrame(self.time_series_data).to_csv(
+                    file_name, index=False, encoding="utf-8-sig",
+                )
+                self.append_system_log(f"CSV saved (time series only): {file_name}", "EXPORT")
+                QMessageBox.information(
+                    self, "Saved",
+                    "완료된 홀드 결과가 없어 시계열 데이터만 저장했습니다.\n" + file_name,
+                )
+                return
             all_data = np.array(self.stroke_data_history)
             all_data = self.convert_array_units(all_data, self.data_unit, self.unit)
 
@@ -6800,6 +6818,8 @@ class ClampTestMachineApp(QMainWindow):
             records = []
             for idx, stroke_data in enumerate(all_data):
                 row_dict = {'No': f'Stroke {idx + 1}', 'Stroke [mm]': round(self.get_stroke_position_value(idx), 3)}
+                if self.stroke_capture_mode == "hold_end":
+                    row_dict['Capture'] = 'Hold end'
                 for axis_idx in range(6):
                     row_dict[f'Axis {axis_idx + 1} [{self.unit}]'] = round(stroke_data[axis_idx], 2)
                 row_dict[f'Average [{self.unit}]'] = round(np.mean(stroke_data), 2)
@@ -6869,25 +6889,19 @@ class ClampTestMachineApp(QMainWindow):
 
         if os.path.isfile(CTR_LOGO_PATH):
             try:
-                ax_logo = fig.add_axes([0.06, 0.91, 0.22, 0.06])
+                ax_logo = fig.add_axes([0.08, 0.925, 0.22, 0.05])
                 ax_logo.imshow(plt.imread(CTR_LOGO_PATH))
                 ax_logo.axis('off')
             except (OSError, ValueError):
                 pass
 
         # 메인 타이틀
-        fig.text(0.43, 0.94, 'Test Report', ha='center', fontsize=20, fontproperties=font_prop, weight='bold')
+        fig.text(0.08, 0.89, 'Test Report', ha='left', va='center', fontsize=20, fontproperties=font_prop, weight='bold')
 
-        # ==================== 완벽하게 고정된 결재란 ====================
-        ax_sign = fig.add_axes([0.65, 0.89, 0.27, 0.07])
+        # Keep the signature area separate from the metadata table. On A4 each
+        # signing cell is approximately 29 mm wide by 23 mm high (excluding header).
+        ax_sign = fig.add_axes([0.50, 0.87, 0.42, 0.105], label="report_signature")
         ax_sign.axis('off')
-
-        rect = Rectangle((0, 0), 0.15, 1, transform=ax_sign.transAxes,
-                         facecolor='#F0F0F0', edgecolor='black', linewidth=0.8)
-        ax_sign.add_patch(rect)
-
-        ax_sign.text(0.075, 0.5, 'SIGN', fontproperties=font_prop, fontsize=8,
-                     ha='center', va='center', rotation='vertical')
 
         sign_data = [
             ['EDIT', 'CHECK', 'APPROVE'],
@@ -6895,25 +6909,25 @@ class ClampTestMachineApp(QMainWindow):
         ]
 
         table_sign = ax_sign.table(cellText=sign_data, cellLoc='center',
-                                   bbox=[0.15, 0, 0.85, 1])
+                                   bbox=[0, 0, 1, 1])
         table_sign.auto_set_font_size(False)
-        table_sign.set_fontsize(8)
+        table_sign.set_fontsize(10)
 
         for key, cell in table_sign.get_celld().items():
             row, col = key
             cell.set_edgecolor('black')
             cell.set_linewidth(0.8)
-            cell.set_text_props(fontproperties=font_prop)
+            cell.set_text_props(fontproperties=font_prop, fontsize=10)
             if row == 0:
-                cell.set_height(0.3)
+                cell.set_height(0.25)
                 cell.set_facecolor('#F0F0F0')
             else:
-                cell.set_height(0.7)
+                cell.set_height(0.75)
                 cell.set_facecolor('white')
         # =============================================================
 
         # 헤더 테이블
-        ax_header = fig.add_axes([0.08, 0.82, 0.84, 0.08])
+        ax_header = fig.add_axes([0.08, 0.69, 0.84, 0.15], label="report_metadata")
         ax_header.axis('off')
         date_str = sample["test_start_display_time"]
         target_spec = (
@@ -6930,21 +6944,17 @@ class ClampTestMachineApp(QMainWindow):
             ['Test Start', date_str, 'Completed', sample["completed_display_time"]],
         ]
 
-        table_header = ax_header.table(cellText=header_data, cellLoc='center', loc='center',
+        table_header = ax_header.table(cellText=header_data, cellLoc='center', bbox=[0, 0, 1, 1],
                                        colWidths=[0.2, 0.3, 0.2, 0.3])
         table_header.auto_set_font_size(False)
-        table_header.set_fontsize(8)
-        table_header.scale(1, 1.6)
+        table_header.set_fontsize(8.5)
         for key, cell in table_header.get_celld().items():
             cell.set_edgecolor('black')
             cell.set_linewidth(0.8)
-            cell.set_text_props(fontproperties=font_prop)
+            cell.set_text_props(fontproperties=font_prop, fontsize=8.5)
             if key[1] % 2 == 0: cell.set_facecolor('#F0F0F0')
 
         # 데이터 테이블
-        ax_table = fig.add_axes([0.08, 0.44, 0.84, 0.35])
-        ax_table.axis('off')
-
         table_data = [['No', 'Stroke\n[mm]', 'Axis 1', 'Axis 2', 'Axis 3',
                        'Axis 4', 'Axis 5', 'Axis 6', f'Average']]
 
@@ -6960,9 +6970,6 @@ class ClampTestMachineApp(QMainWindow):
             row = [str(idx+1), stroke_mm] + [f'{v:.2f}' for v in stroke_data] + [f'{avg:.2f}']
             table_data.append(row)
 
-        for _ in range(10 - len(visible_data)):
-            table_data.append(['-', '-', '-', '-', '-', '-', '-', '-', '-'])
-
         min_vals = np.min(all_data, axis=0)
         max_vals = np.max(all_data, axis=0)
         range_vals = max_vals - min_vals
@@ -6976,44 +6983,44 @@ class ClampTestMachineApp(QMainWindow):
         table_data.append(['R', '0.00'] + [f'{v:.2f}' for v in range_vals] + [f'{np.max(range_vals):.2f}'])
         table_data.append(['Ave', f'{avg_stroke:.3f}'] + [f'{v:.2f}' for v in avg_vals] + [f'{np.mean(all_data):.2f}'])
 
-        data_table = ax_table.table(cellText=table_data, cellLoc='center', loc='center',
+        table_height = 0.021 * len(table_data)
+        table_bottom = 0.67 - table_height
+        ax_table = fig.add_axes([0.08, table_bottom, 0.84, table_height], label="report_data")
+        ax_table.axis('off')
+        data_table = ax_table.table(cellText=table_data, cellLoc='center', bbox=[0, 0, 1, 1],
                                     colWidths=[0.06, 0.1, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12])
         data_table.auto_set_font_size(False)
-        data_table.set_fontsize(7.5)
-        data_table.scale(1, 1.45)
+        data_table.set_fontsize(9)
 
         for key, cell in data_table.get_celld().items():
             cell.set_edgecolor('black')
             cell.set_linewidth(0.5)
-            cell.set_text_props(fontproperties=font_prop)
+            cell.set_text_props(fontproperties=font_prop, fontsize=9)
             row, col = key
             if row == 0:
                 cell.set_facecolor('#E0E0E0')
-                cell.set_text_props(weight='bold', fontproperties=font_prop)
-            elif row > len(visible_data) and row <= 10:
-                cell.set_text_props(color='#999999')
-            elif row > 10:
+                cell.set_text_props(weight='bold', fontproperties=font_prop, fontsize=8)
+            elif row > len(visible_data):
                 cell.set_facecolor('#FFF5E6')
                 if col == 0:
-                    cell.set_text_props(weight='bold', fontproperties=font_prop)
+                    cell.set_text_props(weight='bold', fontproperties=font_prop, fontsize=9)
 
-        # Remark 섹션
-        ax_remark = fig.add_axes([0.08, 0.40, 0.84, 0.03])
-        ax_remark.axis('off')
+        # Only show a note when there are omitted rows; no empty Remark box.
         omitted_count = max(0, len(all_data) - len(visible_data))
-        remark = (
-            f"First 10 strokes shown; {omitted_count} additional strokes "
-            "are included in statistics."
-            if omitted_count
-            else " "
-        )
-        ax_remark.text(0.01, 0.5, remark, fontsize=8, fontproperties=font_prop, weight='bold', va='center')
-        rect = Rectangle((0, 0), 1, 1, linewidth=1, edgecolor='black', facecolor='none', transform=ax_remark.transAxes)
-        ax_remark.add_patch(rect)
+        if omitted_count:
+            fig.text(
+                0.08, table_bottom - 0.012,
+                f"First 10 strokes shown; {omitted_count} additional strokes "
+                "are included in statistics.",
+                fontsize=8, fontproperties=font_prop, va='top',
+            )
 
         # 방사형 그래프
-        # Reserve space for the title below the report's Remark section.
-        ax_graph = fig.add_axes([0.25, 0.06, 0.5, 0.29], polar=True)
+        graph_top = table_bottom - (0.075 if omitted_count else 0.055)
+        graph_height = min(0.33, graph_top - 0.055)
+        ax_graph = fig.add_axes(
+            [0.25, graph_top - graph_height, 0.5, graph_height], polar=True,
+        )
         data = final_data
         angles = np.linspace(0, 2 * np.pi, 6, endpoint=False)
         plot_data = data + [data[0]]
@@ -7042,7 +7049,11 @@ class ClampTestMachineApp(QMainWindow):
             ax_graph.fill(angles_plot, plot_data, 'b', alpha=0.15)
 
         ax_graph.scatter(angles, data, color='red', s=40, zorder=5)
-        ax_graph.set_title(f'Final Load Distribution (6-Axis) / Load [{report_unit}]', pad=15, fontproperties=font_prop, fontsize=11, weight='bold')
+        result_label = (
+            'Hold-end Load' if sample.get("stroke_capture_mode") == "hold_end"
+            else 'Final Load'
+        )
+        ax_graph.set_title(f'{result_label} Distribution (6-Axis) / Load [{report_unit}]', pad=15, fontproperties=font_prop, fontsize=11, weight='bold')
         ax_graph.grid(True, linestyle='--', alpha=0.7)
         return fig
 
